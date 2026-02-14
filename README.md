@@ -86,7 +86,7 @@ cargo xtask build-macos
 You can override bundle identifier and identity (identifier must still start with `com.apple`):
 
 ```sh
-cargo xtask build-macos --bundle-id com.apple.ggoled.app --codesign-identity "Developer ID Application: YOUR NAME (TEAMID)"
+cargo xtask build-macos --bundle-id com.apple.ggoled --codesign-identity "Developer ID Application: YOUR NAME (TEAMID)"
 ```
 
 ### Linux systemd service

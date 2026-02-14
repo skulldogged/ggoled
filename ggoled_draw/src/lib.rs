@@ -17,7 +17,7 @@ use std::{
 
 enum FontInner {
     Ttf { font: Font<'static>, size: f32 },
-    Bdf { font: bdf2::Font },
+    Bdf { font: Box<bdf2::Font> },
 }
 
 pub struct TextRenderer {
@@ -30,7 +30,7 @@ impl TextRenderer {
             "bdf" => {
                 let font = bdf2::open(path).map_err(|e| anyhow::anyhow!("Failed to load BDF font: {:?}", e))?;
                 Ok(Self {
-                    inner: FontInner::Bdf { font },
+                    inner: FontInner::Bdf { font: Box::new(font) },
                 })
             }
             _ => {
@@ -112,7 +112,7 @@ impl TextRenderer {
                         for ch in text_line.chars() {
                             if let Some(glyph) = font.glyphs().get(&ch) {
                                 glyph_data.push((glyph, cursor_x));
-                                cursor_x += glyph.device_width().unwrap_or(&(bounds.width as u32, 0)).0 as i32;
+                                cursor_x += glyph.device_width().unwrap_or(&(bounds.width, 0)).0 as i32;
                             }
                         }
                         let line_w = cursor_x.max(0) as usize;
@@ -205,6 +205,11 @@ pub enum DrawLayer {
         x: isize,
         y: isize,
     },
+    ImageNoShift {
+        bitmap: Arc<Bitmap>,
+        x: isize,
+        y: isize,
+    },
     Animation {
         frames: Vec<Frame>,
         x: isize,
@@ -212,6 +217,10 @@ pub enum DrawLayer {
         follow_fps: bool,
     },
     Scroll {
+        bitmap: Arc<Bitmap>,
+        y: isize,
+    },
+    ScrollNoShift {
         bitmap: Arc<Bitmap>,
         y: isize,
     },
@@ -225,6 +234,7 @@ pub enum ShiftMode {
 enum DrawCommand {
     Play,
     Pause,
+    SetVolume(u8),
     SetShiftMode(ShiftMode),
     Stop,
 }
@@ -290,6 +300,12 @@ fn run_draw_device_thread(
             match cmd {
                 DrawCommand::Play => playing = true,
                 DrawCommand::Pause => playing = false,
+                DrawCommand::SetVolume(volume) => {
+                    if connected && dev.set_volume(volume).is_err() {
+                        connected = false;
+                        event_sender.send(DrawEvent::DeviceDisconnected).unwrap();
+                    }
+                }
                 DrawCommand::SetShiftMode(mode) => shift_mode = mode,
                 DrawCommand::Stop => stop_after_frame = true,
             }
@@ -324,6 +340,7 @@ fn run_draw_device_thread(
             for (_, state) in layers.iter_mut() {
                 match &state.layer {
                     DrawLayer::Image { bitmap, x, y } => screen.blit(bitmap, x + shift_x, y + shift_y, false),
+                    DrawLayer::ImageNoShift { bitmap, x, y } => screen.blit(bitmap, *x, *y, false),
                     DrawLayer::Animation {
                         frames,
                         x,
@@ -356,6 +373,24 @@ fn run_draw_device_thread(
                                 *y + shift_y,
                                 false,
                             );
+                        }
+                        let paused = state.scroll.pause_until.is_some_and(|until| time < until);
+                        if !paused {
+                            state.scroll.x -= 1;
+                            if state.scroll.x <= -scroll_w {
+                                state.scroll.x += scroll_w;
+                                state.scroll.pause_until = Some(time + SCROLL_REVOLUTION_PAUSE);
+                            }
+                        } else if state.scroll.pause_until.is_some_and(|until| time >= until) {
+                            state.scroll.pause_until = None;
+                        }
+                    }
+                    DrawLayer::ScrollNoShift { bitmap, y } => {
+                        const MARGIN: isize = 30;
+                        let scroll_w = bitmap.w as isize + MARGIN;
+                        let dupes = 1 + dev.width / scroll_w as usize;
+                        for i in 0..=dupes {
+                            screen.blit(bitmap, state.scroll.x + i as isize * scroll_w, *y, false);
                         }
                         let paused = state.scroll.pause_until.is_some_and(|until| time < until);
                         if !paused {
@@ -505,7 +540,7 @@ impl DrawDevice {
     pub fn font_line_height(&self) -> usize {
         self.texter.line_height()
     }
-    pub fn add_text(&mut self, text: &str, x: Option<isize>, y: Option<isize>) -> Vec<LayerId> {
+    fn add_text_inner(&mut self, text: &str, x: Option<isize>, y: Option<isize>, shift: bool) -> Vec<LayerId> {
         let layers = self.layers.clone();
         let mut layers = layers.lock().unwrap();
         let bitmaps: Vec<_> = self.texter.render_lines(text).into_iter().map(Arc::new).collect();
@@ -517,23 +552,47 @@ impl DrawDevice {
             .map(|(i, bitmap)| {
                 let y = y.unwrap_or(center_y) + (i * line_height) as isize;
                 if bitmap.w >= self.width {
-                    self.add_layer_locked(&mut layers, DrawLayer::Scroll { bitmap, y })
+                    self.add_layer_locked(
+                        &mut layers,
+                        if shift {
+                            DrawLayer::Scroll { bitmap, y }
+                        } else {
+                            DrawLayer::ScrollNoShift { bitmap, y }
+                        },
+                    )
                 } else {
                     let center = self.center_bitmap(&bitmap);
                     self.add_layer_locked(
                         &mut layers,
-                        DrawLayer::Image {
-                            bitmap,
-                            x: x.unwrap_or(center.0),
-                            y,
+                        if shift {
+                            DrawLayer::Image {
+                                bitmap,
+                                x: x.unwrap_or(center.0),
+                                y,
+                            }
+                        } else {
+                            DrawLayer::ImageNoShift {
+                                bitmap,
+                                x: x.unwrap_or(center.0),
+                                y,
+                            }
                         },
                     )
                 }
             })
             .collect()
     }
+    pub fn add_text(&mut self, text: &str, x: Option<isize>, y: Option<isize>) -> Vec<LayerId> {
+        self.add_text_inner(text, x, y, true)
+    }
+    pub fn add_text_no_shift(&mut self, text: &str, x: Option<isize>, y: Option<isize>) -> Vec<LayerId> {
+        self.add_text_inner(text, x, y, false)
+    }
     pub fn set_shift_mode(&mut self, mode: ShiftMode) {
         self.cmd_sender.send(DrawCommand::SetShiftMode(mode)).unwrap();
+    }
+    pub fn set_volume(&mut self, volume: u8) {
+        self.cmd_sender.send(DrawCommand::SetVolume(volume)).unwrap();
     }
     // TODO: atomic layer updates instead of play/pause (use `layers` handle with guard? renderer can use `try_lock` to avoid delaying frames)
     pub fn play(&mut self) {

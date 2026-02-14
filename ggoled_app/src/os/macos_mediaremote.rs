@@ -9,6 +9,7 @@ use std::ptr::{self, NonNull};
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
 use std::time::Duration;
+use tracing::debug;
 
 const TIMEOUT_DURATION: Duration = Duration::from_secs(2);
 const TITLE_KEY: &str = "kMRMediaRemoteNowPlayingInfoTitle";
@@ -30,22 +31,9 @@ pub struct NowPlaying {
     observers: Vec<Observer>,
 }
 
-fn debug_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("GGOLED_MEDIAREMOTE_DEBUG") {
-        Ok(value) => {
-            let lower = value.trim().to_ascii_lowercase();
-            !(lower.is_empty() || lower == "0" || lower == "false" || lower == "off")
-        }
-        Err(_) => false,
-    })
-}
-
 macro_rules! mr_debug {
     ($($arg:tt)*) => {
-        if debug_enabled() {
-            eprintln!("[mediaremote] {}", format!($($arg)*));
-        }
+        debug!(target: "mediaremote", "{}", format!($($arg)*));
     };
 }
 

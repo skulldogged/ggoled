@@ -4,6 +4,13 @@ pub struct Media {
     pub artist: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum VolumeKeySignal {
+    Up,
+    Down,
+    Mute,
+}
+
 #[derive(Clone, Copy)]
 pub struct PlatformCapabilities {
     pub media: bool,
@@ -62,4 +69,14 @@ impl MediaControl {
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub fn get_idle_seconds() -> usize {
     0
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn start_volume_key_listener() -> Option<std::sync::mpsc::Receiver<VolumeKeySignal>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn ensure_accessibility_permission(_prompt: bool) -> bool {
+    true
 }

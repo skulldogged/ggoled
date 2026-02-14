@@ -1,5 +1,6 @@
 use super::{Media, PlatformCapabilities};
 use mpris::{PlaybackStatus, PlayerFinder};
+use tracing::warn;
 
 pub fn capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
@@ -17,7 +18,7 @@ impl MediaControl {
         let pf = match PlayerFinder::new() {
             Ok(pf) => Some(pf),
             Err(err) => {
-                eprintln!("failed to create MPRIS player finder: {err:?}");
+                warn!(?err, "failed to create MPRIS player finder");
                 None
             }
         };

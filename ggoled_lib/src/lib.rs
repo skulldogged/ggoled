@@ -7,6 +7,7 @@ use std::{cmp::min, time::Duration};
 // NOTE: these work for Arctis Nova Pro but might not for different products!
 const SCREEN_REPORT_SPLIT_SZ: usize = 64;
 const SCREEN_REPORT_SIZE: usize = 1024;
+const BASE_STATION_VOLUME_MAX: u8 = 0x38;
 
 type DrawReport = [u8; SCREEN_REPORT_SIZE];
 
@@ -286,6 +287,19 @@ impl Device {
         Ok(())
     }
 
+    /// Set base station volume where `0` is mute and `56` is max volume.
+    pub fn set_volume(&self, value: u8) -> anyhow::Result<()> {
+        if value > BASE_STATION_VOLUME_MAX {
+            bail!("volume too high");
+        }
+        let mut report = [0; 64];
+        report[0] = 0x06; // hid report id
+        report[1] = 0x25; // command id
+        report[2] = BASE_STATION_VOLUME_MAX.saturating_sub(value);
+        self.oled_dev.write(&report)?;
+        Ok(())
+    }
+
     /// Return to SteelSeries UI.
     pub fn return_to_ui(&self) -> anyhow::Result<()> {
         let mut report = [0; 64];
@@ -303,7 +317,7 @@ impl Device {
         }
         Some(match buf[1] {
             0x25 => DeviceEvent::Volume {
-                volume: 0x38u8.saturating_sub(buf[2]),
+                volume: BASE_STATION_VOLUME_MAX.saturating_sub(buf[2]),
             },
             0xb5 => DeviceEvent::HeadsetConnection {
                 wireless: buf[4] == 8,

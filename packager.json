@@ -1,7 +1,7 @@
 {
   "name": "ggoled_app",
   "product-name": "GGOLED",
-  "identifier": "com.ggoled.app",
+  "identifier": "com.apple.ggoled",
   "version": "0.1.0",
   "out-dir": "./dist",
   "binaries-dir": "target/release",
