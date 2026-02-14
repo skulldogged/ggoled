@@ -5,7 +5,7 @@ mod os;
 use chrono::{Local, TimeDelta, Timelike};
 use ggoled_draw::{bitmap_from_memory, DrawDevice, DrawEvent, LayerId, ShiftMode, TextRenderer};
 use ggoled_lib::Device;
-use os::{get_idle_seconds, Media, MediaControl};
+use os::{get_idle_seconds, get_autostart, set_autostart, Media, MediaControl};
 use rfd::{MessageDialog, MessageLevel};
 use sdl3_sys::everything as sdl;
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,7 @@ struct Config {
     idle_timeout: bool,
     oled_shift: ConfigShiftMode,
     show_notifications: bool,
+    autostart: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -62,6 +63,7 @@ impl Default for Config {
             idle_timeout: true,
             oled_shift: ConfigShiftMode::default(),
             show_notifications: true,
+            autostart: false,
         }
     }
 }
@@ -155,6 +157,7 @@ fn menu_callback(entry: *mut sdl::SDL_TrayEntry, f: impl Fn()) {
 enum MenuEvent {
     ToggleCheck,
     SetShiftMode(ConfigShiftMode),
+    ToggleAutostart,
     Quit,
 }
 
@@ -168,6 +171,9 @@ fn bind_menu_event(entry: *mut sdl::SDL_TrayEntry, tx: &mpsc::Sender<MenuEvent>,
 fn main() {
     // Initial loading
     let mut config = Config::load();
+    
+    // Sync autostart with registry
+    config.autostart = get_autostart();
 
     // Create tray icon with menu
     unsafe { sdl::SDL_SetHint(sdl::SDL_HINT_VIDEO_ALLOW_SCREENSAVER, c"1".as_ptr()) };
@@ -188,6 +194,9 @@ fn main() {
     bind_menu_event(tm_notif_check, &menu_tx, MenuEvent::ToggleCheck);
     let tm_idle_check = menu_check(menu, c"Screensaver when idle", config.idle_timeout);
     bind_menu_event(tm_idle_check, &menu_tx, MenuEvent::ToggleCheck);
+    
+    let tm_autostart_check = menu_check(menu, c"Start at login", config.autostart);
+    bind_menu_event(tm_autostart_check, &menu_tx, MenuEvent::ToggleAutostart);
     // TODO: implement idle check on linux
     #[cfg(target_os = "linux")]
     unsafe {
@@ -272,6 +281,12 @@ fn main() {
                     unsafe { sdl::SDL_SetTrayEntryChecked(tm_shift_simple, matches!(mode, ConfigShiftMode::Simple)) };
                     dev.set_shift_mode(config.oled_shift.to_api());
                 }
+                MenuEvent::ToggleAutostart => {
+                    config.autostart = !config.autostart;
+                    set_autostart(config.autostart);
+                    unsafe { sdl::SDL_SetTrayEntryChecked(tm_autostart_check, config.autostart) };
+                    config_updated = true;
+                }
                 MenuEvent::Quit => break 'main,
             }
         }
@@ -346,7 +361,7 @@ fn main() {
                 // Time
                 dev.remove_layers(&time_layers);
                 if config.show_time {
-                    let time_str = time.format("%H:%M:%S").to_string();
+                    let time_str = time.format("%I:%M:%S %p").to_string();
                     time_layers = dev.add_text(&time_str, None, if media.is_some() { Some(8) } else { None });
                 }
 

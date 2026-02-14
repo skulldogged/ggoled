@@ -9,4 +9,5 @@ ggoled_lib = { path = "../ggoled_lib" }
 anyhow = "1.0"
 image = { version = "0.25", features = ["gif"] }
 rusttype = "0.9"
+bdf2 = "0.7"
 spin_sleep = "1.3"

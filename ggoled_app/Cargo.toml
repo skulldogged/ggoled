@@ -17,7 +17,7 @@ rfd = "*"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = ["Media_Control"] }
-windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation", "Win32_System_Console", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_SystemInformation", "Win32_System_Console", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Registry"] }
 sdl3-sys = { version = "0.5", features = ["build-from-source-static"] }
 
 [target.'cfg(windows)'.build-dependencies]

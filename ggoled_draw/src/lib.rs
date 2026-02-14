@@ -15,64 +15,133 @@ use std::{
     time::{Duration, Instant},
 };
 
+enum FontInner {
+    Ttf { font: Font<'static>, size: f32 },
+    Bdf { font: bdf2::Font },
+}
+
 pub struct TextRenderer {
-    font: Font<'static>,
-    size: f32,
+    inner: FontInner,
 }
 impl TextRenderer {
     pub fn load_from_file(path: &PathBuf, size: f32) -> anyhow::Result<Self> {
-        let data = std::fs::read(path)?;
-        let Some(font) = Font::try_from_vec(data) else {
-            bail!("Failed to load font");
-        };
-        Ok(Self { font, size })
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        match ext.to_lowercase().as_str() {
+            "bdf" => {
+                let font = bdf2::open(path).map_err(|e| anyhow::anyhow!("Failed to load BDF font: {:?}", e))?;
+                Ok(Self {
+                    inner: FontInner::Bdf { font },
+                })
+            }
+            _ => {
+                let data = std::fs::read(path)?;
+                let Some(font) = Font::try_from_vec(data) else {
+                    bail!("Failed to load font");
+                };
+                Ok(Self {
+                    inner: FontInner::Ttf { font, size },
+                })
+            }
+        }
     }
     pub fn new_pixel_operator() -> Self {
         Self {
-            font: Font::try_from_bytes(include_bytes!("../fonts/PixelOperator.ttf")).unwrap(),
-            size: 16.0,
+            inner: FontInner::Ttf {
+                font: Font::try_from_bytes(include_bytes!("../fonts/PixelOperator.ttf")).unwrap(),
+                size: 16.0,
+            },
         }
     }
-    fn scale(&self) -> Scale {
-        Scale::uniform(self.size)
-    }
     pub fn line_height(&self) -> usize {
-        let v_metrics = self.font.v_metrics(self.scale());
-        (v_metrics.ascent - v_metrics.descent).ceil() as usize
+        match &self.inner {
+            FontInner::Ttf { font, size } => {
+                let scale = Scale::uniform(*size);
+                let v_metrics = font.v_metrics(scale);
+                (v_metrics.ascent - v_metrics.descent).ceil() as usize
+            }
+            FontInner::Bdf { font } => font.bounds().height as usize,
+        }
     }
     pub fn render_lines(&self, text: &str) -> Vec<Bitmap> {
         let clean_text = text.replace('\r', "");
         let text_lines = clean_text.split('\n');
-        text_lines
-            .map(|text_line| {
-                let glyphs: Vec<_> = self.font.layout(text_line, self.scale(), point(0.0, 0.0)).collect();
-                let mut line_w_offset = 0;
-                let mut line_h_offset = 0;
-                let mut line_w = 0;
-                let mut line_h = 0;
-                for bb in glyphs.iter().filter_map(|g| g.pixel_bounding_box()) {
-                    line_w_offset = line_w_offset.max(-bb.min.x);
-                    line_h_offset = line_h_offset.max(-bb.min.y);
-                    line_w = line_w.max(bb.max.x + 1);
-                    line_h = line_h.max(bb.max.y + 1);
-                }
-                let line_w = (line_w + line_w_offset) as usize;
-                let line_h = (line_h + line_h_offset) as usize;
-                let mut bitmap = Bitmap::new(line_w, line_h, false);
-                for glyph in glyphs {
-                    if let Some(bb) = glyph.pixel_bounding_box() {
-                        glyph.draw(|x, y, v| {
-                            if v > 0.5 {
-                                let px = (x as i32 + line_w_offset + bb.min.x) as usize;
-                                let py = (y as i32 + line_h_offset + bb.min.y) as usize;
-                                bitmap.data.set(py * line_w + px, true);
+        match &self.inner {
+            FontInner::Ttf { font, size } => {
+                let scale = Scale::uniform(*size);
+                text_lines
+                    .map(|text_line| {
+                        let glyphs: Vec<_> = font.layout(text_line, scale, point(0.0, 0.0)).collect();
+                        let mut line_w_offset = 0;
+                        let mut line_h_offset = 0;
+                        let mut line_w = 0;
+                        let mut line_h = 0;
+                        for bb in glyphs.iter().filter_map(|g| g.pixel_bounding_box()) {
+                            line_w_offset = line_w_offset.max(-bb.min.x);
+                            line_h_offset = line_h_offset.max(-bb.min.y);
+                            line_w = line_w.max(bb.max.x + 1);
+                            line_h = line_h.max(bb.max.y + 1);
+                        }
+                        let line_w = (line_w + line_w_offset) as usize;
+                        let line_h = (line_h + line_h_offset) as usize;
+                        let mut bitmap = Bitmap::new(line_w, line_h, false);
+                        for glyph in glyphs {
+                            if let Some(bb) = glyph.pixel_bounding_box() {
+                                glyph.draw(|x, y, v| {
+                                    if v > 0.5 {
+                                        let px = (x as i32 + line_w_offset + bb.min.x) as usize;
+                                        let py = (y as i32 + line_h_offset + bb.min.y) as usize;
+                                        bitmap.data.set(py * line_w + px, true);
+                                    }
+                                })
                             }
-                        })
-                    }
-                }
-                bitmap
-            })
-            .collect()
+                        }
+                        bitmap
+                    })
+                    .collect()
+            }
+            FontInner::Bdf { font } => {
+                let bounds = font.bounds();
+                let line_h = bounds.height as usize;
+                text_lines
+                    .map(|text_line| {
+                        if text_line.is_empty() {
+                            return Bitmap::new(0, line_h, false);
+                        }
+                        let mut glyph_data: Vec<(&bdf2::Glyph, i32)> = Vec::new();
+                        let mut cursor_x: i32 = 0;
+                        for ch in text_line.chars() {
+                            if let Some(glyph) = font.glyphs().get(&ch) {
+                                glyph_data.push((glyph, cursor_x));
+                                cursor_x += glyph.device_width().unwrap_or(&(bounds.width as u32, 0)).0 as i32;
+                            }
+                        }
+                        let line_w = cursor_x.max(0) as usize;
+                        if line_w == 0 {
+                            return Bitmap::new(0, line_h, false);
+                        }
+                        let mut bitmap = Bitmap::new(line_w, line_h, false);
+                        for (glyph, x_off) in &glyph_data {
+                            let gb = glyph.bounds();
+                            let baseline_y = bounds.height as i32 + bounds.y;
+                            let glyph_origin_y = baseline_y - gb.height as i32 - gb.y;
+                            let glyph_origin_x = *x_off + gb.x;
+                            for gy in 0..glyph.height() as i32 {
+                                for gx in 0..glyph.width() as i32 {
+                                    if glyph.get(gx as u32, gy as u32) {
+                                        let px = (glyph_origin_x + gx) as usize;
+                                        let py = (glyph_origin_y + gy) as usize;
+                                        if px < line_w && py < line_h {
+                                            bitmap.data.set(py * line_w + px, true);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        bitmap
+                    })
+                    .collect()
+            }
+        }
     }
 }
 
