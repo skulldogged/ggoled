@@ -6,8 +6,10 @@ use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSNotification, NSNotificationCenter, NSString};
 use std::ffi::c_void;
 use std::ptr::{self, NonNull};
+use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard};
+use std::thread::JoinHandle;
 use std::time::Duration;
 use tracing::debug;
 
@@ -29,6 +31,8 @@ pub struct NowPlayingInfo {
 pub struct NowPlaying {
     info: Arc<RwLock<NowPlayingInfo>>,
     observers: Vec<Observer>,
+    refresh_tx: Option<Sender<()>>,
+    refresh_thread: Option<JoinHandle<()>>,
 }
 
 macro_rules! mr_debug {
@@ -209,6 +213,7 @@ impl NowPlaying {
     pub fn new() -> Self {
         let info = Arc::new(RwLock::new(NowPlayingInfo::default()));
         let mut observers = vec![];
+        let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<()>();
         mr_debug!("NowPlaying::new");
 
         unsafe {
@@ -221,25 +226,46 @@ impl NowPlaying {
             }
         }
 
-        refresh_all(Arc::clone(&info));
+        let refresh_info = Arc::clone(&info);
+        let refresh_thread = std::thread::Builder::new()
+            .name("ggoled-mediaremote-refresh".to_string())
+            .spawn(move || {
+                mr_debug!("mediaremote refresh worker started");
+                while refresh_rx.recv().is_ok() {
+                    // Coalesce bursts of notifications into one refresh.
+                    while refresh_rx.try_recv().is_ok() {}
+                    refresh_all(Arc::clone(&refresh_info));
+                }
+                mr_debug!("mediaremote refresh worker exited");
+            })
+            .ok();
+        if refresh_thread.is_none() {
+            mr_debug!("failed to spawn mediaremote refresh worker");
+        }
+        _ = refresh_tx.send(());
 
         {
-            let info = Arc::clone(&info);
+            let refresh_tx = refresh_tx.clone();
             observers.push(add_observer(NOTIF_INFO_CHANGE, move || {
                 mr_debug!("received notification: {}", NOTIF_INFO_CHANGE);
-                refresh_all(Arc::clone(&info));
+                _ = refresh_tx.send(());
             }));
         }
         {
-            let info = Arc::clone(&info);
+            let refresh_tx = refresh_tx.clone();
             observers.push(add_observer(NOTIF_PLAYING_CHANGE, move || {
                 mr_debug!("received notification: {}", NOTIF_PLAYING_CHANGE);
-                refresh_all(Arc::clone(&info));
+                _ = refresh_tx.send(());
             }));
         }
         mr_debug!("installed {} NSNotification observers", observers.len());
 
-        Self { info, observers }
+        Self {
+            info,
+            observers,
+            refresh_tx: Some(refresh_tx),
+            refresh_thread,
+        }
     }
 
     pub fn get_info(&self) -> RwLockReadGuard<'_, NowPlayingInfo> {
@@ -252,6 +278,10 @@ impl Drop for NowPlaying {
         mr_debug!("NowPlaying::drop");
         while let Some(observer) = self.observers.pop() {
             remove_observer(observer);
+        }
+        self.refresh_tx.take();
+        if let Some(thread) = self.refresh_thread.take() {
+            _ = thread.join();
         }
 
         unsafe {
