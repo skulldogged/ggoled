@@ -38,7 +38,7 @@ pub enum DeviceEvent {
 
 pub struct Device {
     oled_dev: HidDevice,
-    info_dev: HidDevice,
+    info_dev: Option<HidDevice>,
     pub width: usize,
     pub height: usize,
 }
@@ -62,35 +62,37 @@ impl Device {
             })
             .collect();
 
-        // We're expecting to find exactly two devices with different HID descriptors
+        // On some platforms this can be duplicated or collapsed, so we only require at least one candidate.
         if device_infos.is_empty() {
             bail!("No matching devices connected");
-        } else if device_infos.len() < 2 {
-            bail!("Too few matching devices connected");
-        } else if device_infos.len() > 2 {
-            bail!("Too many matching devices connected");
         }
 
-        // On Linux, both devices can get put under the same hidraw interface, meaning we use the same device for both
-        let (oled_dev, info_dev) = if device_infos[0].path() == device_infos[1].path() {
-            let Ok(oled_dev) = device_infos[0].open_device(&api) else {
-                bail!("Failed to connect to USB device");
-            };
-            let Ok(info_dev) = device_infos[0].open_device(&api) else {
-                bail!("Failed to connect to USB device");
+        // If all entries point to the same path, use one handle for drawing and best-effort second handle for events.
+        let all_same_path = device_infos.iter().all(|d| d.path() == device_infos[0].path());
+
+        let (oled_dev, info_dev) = if all_same_path {
+            let oled_dev = device_infos[0]
+                .open_device(&api)
+                .map_err(|err| anyhow::anyhow!("Failed to connect to USB device: {err}"))?;
+            let info_dev = match device_infos[0].open_device(&api) {
+                Ok(dev) => Some(dev),
+                Err(err) => {
+                    eprintln!(
+                        "warning: failed to open second handle for shared HID path (falling back to single handle): {err}"
+                    );
+                    None
+                }
             };
             (oled_dev, info_dev)
 
-        // On Windows (and maybe some Linux variants), they are separate interfaces and have to be opened separately
+        // On platforms exposing separate interfaces, pick OLED by descriptor and best-effort select an info interface.
         } else {
-            // Open both devices
-            let Ok(mut devices) = device_infos
+            // Open all candidates
+            let mut devices = device_infos
                 .iter()
                 .map(|info| anyhow::Ok(info.open_device(&api)?))
                 .collect::<anyhow::Result<Vec<_>>>()
-            else {
-                bail!("Failed to connect to USB device");
-            };
+                .map_err(|err| anyhow::anyhow!("Failed to connect to USB device: {err}"))?;
 
             // Get descriptors
             let Ok(mut device_reports) = devices
@@ -105,17 +107,24 @@ impl Device {
                 bail!("Failed to get USB device HID reports");
             };
 
-            // Identify and open the two devices by their descriptors
-            let Some(oled_dev_idx) = device_reports.iter().position(|desc| desc[1] == 0xc0) else {
+            // Identify OLED endpoint by descriptor.
+            let Some(oled_dev_idx) = device_reports.iter().position(|desc| desc.get(1) == Some(&0xc0)) else {
                 bail!("No OLED device found");
             };
             _ = device_reports.swap_remove(oled_dev_idx);
             let oled_dev = devices.swap_remove(oled_dev_idx);
-            let Some(info_dev_idx) = device_reports.iter().position(|desc| desc[1] == 0x00) else {
-                bail!("No info device found");
+
+            // Prefer known info descriptor (0x00), otherwise fallback to any non-OLED descriptor.
+            let info_dev = if let Some(info_dev_idx) = device_reports.iter().position(|desc| desc.get(1) == Some(&0x00))
+            {
+                Some(devices.swap_remove(info_dev_idx))
+            } else if let Some(fallback_idx) = device_reports.iter().position(|desc| desc.get(1) != Some(&0xc0)) {
+                eprintln!("warning: using fallback HID interface for device events");
+                Some(devices.swap_remove(fallback_idx))
+            } else {
+                eprintln!("warning: no separate HID event interface detected, using single-handle mode");
+                None
             };
-            _ = device_reports.swap_remove(info_dev_idx);
-            let info_dev = devices.swap_remove(info_dev_idx);
 
             (oled_dev, info_dev)
         };
@@ -312,19 +321,25 @@ impl Device {
 
     /// Poll events from the device. This blocks until an event is returned.
     pub fn poll_event(&self) -> anyhow::Result<Option<DeviceEvent>> {
+        let Some(info_dev) = self.info_dev.as_ref() else {
+            return Ok(None);
+        };
         let mut buf = [0u8; 64];
-        self.info_dev.set_blocking_mode(true)?;
-        _ = self.info_dev.read(&mut buf)?;
+        info_dev.set_blocking_mode(true)?;
+        _ = info_dev.read(&mut buf)?;
         Ok(Self::parse_event(&buf))
     }
 
     /// Return any pending events from the device. Non-blocking.
     pub fn get_events(&self) -> anyhow::Result<Vec<DeviceEvent>> {
-        self.info_dev.set_blocking_mode(false)?;
+        let Some(info_dev) = self.info_dev.as_ref() else {
+            return Ok(vec![]);
+        };
+        info_dev.set_blocking_mode(false)?;
         let mut events = vec![];
         loop {
             let mut buf = [0u8; 64];
-            let len = self.info_dev.read(&mut buf)?;
+            let len = info_dev.read(&mut buf)?;
             if len == 0 {
                 break;
             } else if let Some(event) = Self::parse_event(&buf) {

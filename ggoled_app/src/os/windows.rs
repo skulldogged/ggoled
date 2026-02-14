@@ -1,4 +1,4 @@
-use super::Media;
+use super::{Media, PlatformCapabilities};
 use std::mem::size_of;
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionManager, GlobalSystemMediaTransportControlsSessionPlaybackStatus,
@@ -11,7 +11,14 @@ use windows_sys::Win32::{
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const APP_NAME: &str = "GGOLED";
 
-#[cfg(target_os = "windows")]
+pub fn capabilities() -> PlatformCapabilities {
+    PlatformCapabilities {
+        media: true,
+        idle_timeout: true,
+        autostart: true,
+    }
+}
+
 pub fn set_autostart(enabled: bool) {
     use windows_sys::Win32::System::Registry::{
         RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_WRITE, REG_SZ,
@@ -44,7 +51,6 @@ pub fn set_autostart(enabled: bool) {
     }
 }
 
-#[cfg(target_os = "windows")]
 pub fn get_autostart() -> bool {
     use windows_sys::Win32::System::Registry::{RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_READ, REG_SZ};
 
@@ -74,13 +80,6 @@ pub fn get_autostart() -> bool {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn set_autostart(_enabled: bool) {}
-#[cfg(not(target_os = "windows"))]
-pub fn get_autostart() -> bool {
-    false
-}
-
 pub struct MediaControl {
     mgr: Option<GlobalSystemMediaTransportControlsSessionManager>,
 }
@@ -92,13 +91,14 @@ impl MediaControl {
             .flatten();
         MediaControl { mgr }
     }
-    pub fn get_media(&self) -> Option<Media> {
+    pub fn get_media(&self, include_paused: bool) -> Option<Media> {
         if let Some(mgr) = &self.mgr {
             (|| {
                 let session = mgr.GetCurrentSession()?;
-                let playing = session.GetPlaybackInfo()?.PlaybackStatus()?
-                    == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
-                if playing {
+                let status = session.GetPlaybackInfo()?.PlaybackStatus()?;
+                let allowed = status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing
+                    || (include_paused && status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused);
+                if allowed {
                     let request = session.TryGetMediaPropertiesAsync()?;
                     let media = request.join()?;
                     anyhow::Ok(Some(Media {

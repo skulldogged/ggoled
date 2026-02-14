@@ -242,6 +242,7 @@ struct AnimState {
 }
 struct ScrollState {
     x: isize,
+    pause_until: Option<Instant>,
 }
 
 struct DrawLayerState {
@@ -264,6 +265,7 @@ const OLED_SHIFTS: [(isize, isize); 9] = [
 ];
 
 const RECONNECT_PERIOD: Duration = Duration::from_secs(1);
+const SCROLL_REVOLUTION_PAUSE: Duration = Duration::from_millis(900);
 
 fn run_draw_device_thread(
     mut dev: Device,
@@ -355,9 +357,15 @@ fn run_draw_device_thread(
                                 false,
                             );
                         }
-                        state.scroll.x -= 1;
-                        if state.scroll.x <= -scroll_w {
-                            state.scroll.x += scroll_w;
+                        let paused = state.scroll.pause_until.is_some_and(|until| time < until);
+                        if !paused {
+                            state.scroll.x -= 1;
+                            if state.scroll.x <= -scroll_w {
+                                state.scroll.x += scroll_w;
+                                state.scroll.pause_until = Some(time + SCROLL_REVOLUTION_PAUSE);
+                            }
+                        } else if state.scroll.pause_until.is_some_and(|until| time >= until) {
+                            state.scroll.pause_until = None;
                         }
                     }
                 }
@@ -471,7 +479,10 @@ impl DrawDevice {
                     ticks: 0,
                     next_update: Instant::now(),
                 },
-                scroll: ScrollState { x: 0 },
+                scroll: ScrollState {
+                    x: 0,
+                    pause_until: None,
+                },
             },
         );
         id

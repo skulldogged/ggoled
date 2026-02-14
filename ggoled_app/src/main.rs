@@ -2,25 +2,23 @@
 
 mod os;
 
-use chrono::{Local, TimeDelta, Timelike};
+use chrono::{DateTime, Local, TimeDelta, Timelike};
 use ggoled_draw::{bitmap_from_memory, DrawDevice, DrawEvent, LayerId, ShiftMode, TextRenderer};
 use ggoled_lib::Device;
-use os::{get_idle_seconds, get_autostart, set_autostart, Media, MediaControl};
+use os::{capabilities, get_autostart, get_idle_seconds, set_autostart, Media, MediaControl, PlatformCapabilities};
 use rfd::{MessageDialog, MessageLevel};
-use sdl3_sys::everything as sdl;
 use serde::{Deserialize, Serialize};
-use std::{
-    ffi::CStr,
-    fmt::Debug,
-    os::raw::c_void,
-    path::PathBuf,
-    sync::{mpsc, Arc},
-    thread::sleep,
-    time::Duration,
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tao::event::{Event, StartCause};
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tray_icon::{
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, Submenu},
+    Icon as TrayIconImage, TrayIcon, TrayIconBuilder,
 };
 
 const IDLE_TIMEOUT_SECS: usize = 60;
 const NOTIF_DUR: Duration = Duration::from_secs(5);
+const TICK_DUR: Duration = Duration::from_millis(10);
 
 #[derive(Serialize, Deserialize, Default, Clone, Copy)]
 enum ConfigShiftMode {
@@ -49,6 +47,7 @@ struct Config {
     font: Option<ConfigFont>,
     show_time: bool,
     show_media: bool,
+    show_media_paused: bool,
     idle_timeout: bool,
     oled_shift: ConfigShiftMode,
     show_notifications: bool,
@@ -60,6 +59,7 @@ impl Default for Config {
             font: None,
             show_time: true,
             show_media: true,
+            show_media_paused: false,
             idle_timeout: true,
             oled_shift: ConfigShiftMode::default(),
             show_notifications: true,
@@ -90,240 +90,172 @@ impl Config {
     }
 }
 
-// unwrap an error and show a MessageDialog if it fails
-pub fn dialog_unwrap<T, E: Debug>(res: Result<T, E>) -> T {
-    match res {
-        Ok(v) => v,
-        Err(e) => {
-            let str = format!("Error: {:?}", e);
-            MessageDialog::new()
-                .set_level(MessageLevel::Error)
-                .set_title("ggoled")
-                .set_description(&str)
-                .show();
-            panic!("dialog_unwrap: {}", str);
-        }
-    }
+fn show_error_dialog(msg: &str) {
+    MessageDialog::new()
+        .set_level(MessageLevel::Error)
+        .set_title("ggoled")
+        .set_description(msg)
+        .show();
 }
 
-struct Icon {
-    _pixels: Vec<u8>,
-    surf: *mut sdl::SDL_Surface,
-}
-impl Icon {
-    fn load(buf: &[u8]) -> Self {
-        let pixels = image::load_from_memory(buf)
-            .unwrap()
-            .resize(32, 32, image::imageops::FilterType::Lanczos3)
-            .to_rgba8()
-            .into_vec();
-        let surf = unsafe {
-            sdl::SDL_CreateSurfaceFrom(
-                32,
-                32,
-                sdl::SDL_PixelFormat::RGBA32,
-                pixels.as_ptr() as *mut c_void,
-                32 * 4,
-            )
-        };
-        assert!(!surf.is_null());
-        Self { _pixels: pixels, surf }
-    }
-}
-impl Drop for Icon {
-    fn drop(&mut self) {
-        unsafe { sdl::SDL_DestroySurface(self.surf) };
-    }
+struct TrayState {
+    tray: TrayIcon,
+    icon_ok: TrayIconImage,
+    icon_error: TrayIconImage,
+    tm_time_check: CheckMenuItem,
+    tm_media_check: CheckMenuItem,
+    tm_media_paused_check: CheckMenuItem,
+    tm_notif_check: CheckMenuItem,
+    tm_idle_check: CheckMenuItem,
+    tm_autostart_check: CheckMenuItem,
+    tm_shift_off: CheckMenuItem,
+    tm_shift_simple: CheckMenuItem,
+    tm_quit: MenuItem,
 }
 
-fn menu_check(menu: *mut sdl::SDL_TrayMenu, title: &'static CStr, checked: bool) -> *mut sdl::SDL_TrayEntry {
-    let checked = if checked { sdl::SDL_TRAYENTRY_CHECKED } else { 0 };
-    unsafe { sdl::SDL_InsertTrayEntryAt(menu, -1, title.as_ptr(), sdl::SDL_TRAYENTRY_CHECKBOX | checked) }
+struct RuntimeState {
+    capabilities: PlatformCapabilities,
+    config: Config,
+    tray: TrayState,
+    dev: DrawDevice,
+    mgr: MediaControl,
+    last_time: DateTime<Local>,
+    last_media: Option<Media>,
+    time_layers: Vec<LayerId>,
+    media_layers: Vec<LayerId>,
+    notif_layer: Option<LayerId>,
+    notif_expiry: DateTime<Local>,
+    is_connected: Option<bool>,
+    needs_redraw: bool,
+    icon_hs_connect: Arc<ggoled_lib::Bitmap>,
+    icon_hs_disconnect: Arc<ggoled_lib::Bitmap>,
 }
 
-extern "C" fn c_menu_callback(userdata: *mut c_void, _entry: *mut sdl::SDL_TrayEntry) {
-    #[allow(clippy::borrowed_box)] // needs to be boxed
-    let f: &Box<dyn Fn()> = unsafe { &*(userdata as *mut Box<dyn Fn()>) };
-    f();
+enum UserEvent {
+    MenuEvent(MenuEvent),
 }
 
-fn menu_callback(entry: *mut sdl::SDL_TrayEntry, f: impl Fn()) {
-    let f: Box<Box<dyn Fn()>> = Box::new(Box::new(f));
-    let f = Box::leak(f) as *mut Box<dyn Fn()> as *mut c_void;
-    unsafe { sdl::SDL_SetTrayEntryCallback(entry, Some(c_menu_callback), f) };
-}
+impl RuntimeState {
+    fn new(config: Config, capabilities: PlatformCapabilities, tray: TrayState) -> anyhow::Result<RuntimeState> {
+        let icon_hs_connect =
+            Arc::new(bitmap_from_memory(include_bytes!("../assets/headset_connected.png"), 0x80).unwrap());
+        let icon_hs_disconnect =
+            Arc::new(bitmap_from_memory(include_bytes!("../assets/headset_disconnected.png"), 0x80).unwrap());
 
-#[derive(Clone, Copy)]
-enum MenuEvent {
-    ToggleCheck,
-    SetShiftMode(ConfigShiftMode),
-    ToggleAutostart,
-    Quit,
-}
-
-fn bind_menu_event(entry: *mut sdl::SDL_TrayEntry, tx: &mpsc::Sender<MenuEvent>, event: MenuEvent) {
-    let tx = tx.clone();
-    menu_callback(entry, move || {
-        let _ = tx.send(event);
-    });
-}
-
-fn main() {
-    // Initial loading
-    let mut config = Config::load();
-    
-    // Sync autostart with registry
-    config.autostart = get_autostart();
-
-    // Create tray icon with menu
-    unsafe { sdl::SDL_SetHint(sdl::SDL_HINT_VIDEO_ALLOW_SCREENSAVER, c"1".as_ptr()) };
-    assert!(unsafe { sdl::SDL_Init(sdl::SDL_INIT_VIDEO) });
-    let icon = Icon::load(include_bytes!("../assets/ggoled.png"));
-    let icon_error = Icon::load(include_bytes!("../assets/ggoled_error.png"));
-    let tray = unsafe { sdl::SDL_CreateTray(icon.surf, c"ggoled".as_ptr()) };
-    assert!(!tray.is_null());
-    let menu = unsafe { sdl::SDL_CreateTrayMenu(tray) };
-    assert!(!menu.is_null());
-    let (menu_tx, menu_rx) = mpsc::channel::<MenuEvent>();
-
-    let tm_time_check = menu_check(menu, c"Show time", config.show_time);
-    bind_menu_event(tm_time_check, &menu_tx, MenuEvent::ToggleCheck);
-    let tm_media_check = menu_check(menu, c"Show playing media", config.show_media);
-    bind_menu_event(tm_media_check, &menu_tx, MenuEvent::ToggleCheck);
-    let tm_notif_check = menu_check(menu, c"Show connection notifications", config.show_notifications);
-    bind_menu_event(tm_notif_check, &menu_tx, MenuEvent::ToggleCheck);
-    let tm_idle_check = menu_check(menu, c"Screensaver when idle", config.idle_timeout);
-    bind_menu_event(tm_idle_check, &menu_tx, MenuEvent::ToggleCheck);
-    
-    let tm_autostart_check = menu_check(menu, c"Start at login", config.autostart);
-    bind_menu_event(tm_autostart_check, &menu_tx, MenuEvent::ToggleAutostart);
-    // TODO: implement idle check on linux
-    #[cfg(target_os = "linux")]
-    unsafe {
-        config.idle_timeout = false;
-        sdl::SDL_SetTrayEntryChecked(tm_idle_check, false);
-        sdl::SDL_SetTrayEntryEnabled(tm_idle_check, false);
-    }
-
-    let tm_shift_submenu_entry =
-        unsafe { sdl::SDL_InsertTrayEntryAt(menu, -1, c"OLED screen shift".as_ptr(), sdl::SDL_TRAYENTRY_SUBMENU) };
-    let tm_shift_submenu = unsafe { sdl::SDL_CreateTraySubmenu(tm_shift_submenu_entry) };
-    let tm_shift_off = menu_check(
-        tm_shift_submenu,
-        c"Off",
-        matches!(config.oled_shift, ConfigShiftMode::Off),
-    );
-    bind_menu_event(tm_shift_off, &menu_tx, MenuEvent::SetShiftMode(ConfigShiftMode::Off));
-    let tm_shift_simple = menu_check(
-        tm_shift_submenu,
-        c"Simple",
-        matches!(config.oled_shift, ConfigShiftMode::Simple),
-    );
-    bind_menu_event(
-        tm_shift_simple,
-        &menu_tx,
-        MenuEvent::SetShiftMode(ConfigShiftMode::Simple),
-    );
-    let tm_quit = unsafe { sdl::SDL_InsertTrayEntryAt(menu, -1, c"Quit".as_ptr(), sdl::SDL_TRAYENTRY_BUTTON) };
-    bind_menu_event(tm_quit, &menu_tx, MenuEvent::Quit);
-
-    // Load icons
-    let icon_hs_connect =
-        Arc::new(bitmap_from_memory(include_bytes!("../assets/headset_connected.png"), 0x80).unwrap());
-    let icon_hs_disconnect =
-        Arc::new(bitmap_from_memory(include_bytes!("../assets/headset_disconnected.png"), 0x80).unwrap());
-
-    // State
-    let mgr = MediaControl::new();
-    let mut last_time = Local::now() - TimeDelta::seconds(1);
-    let mut last_media: Option<Media> = None;
-    let mut time_layers: Vec<LayerId> = vec![];
-    let mut media_layers: Vec<LayerId> = vec![];
-    let mut notif_layer: Option<LayerId> = None;
-    let mut notif_expiry = Local::now();
-    let mut is_connected = None; // TODO: probe on startup
-
-    // Connect
-    let mut dev = DrawDevice::new(dialog_unwrap(Device::connect()), 30);
-    if let Some(font) = &config.font {
-        dev.texter = dialog_unwrap(TextRenderer::load_from_file(&font.path, font.size));
-    }
-
-    // Go!
-    dev.set_shift_mode(config.oled_shift.to_api());
-    dev.play();
-    'main: loop {
-        // Window event loop
-        // TODO: handle system going to sleep
-        let mut event = sdl::SDL_Event::default();
-        while unsafe { sdl::SDL_PollEvent(&mut event) } {
-            let event_type = sdl::SDL_EventType(unsafe { event.r#type });
-            if event_type == sdl::SDL_EVENT_QUIT {
-                break 'main;
-            }
+        let mut dev = DrawDevice::new(Device::connect()?, 30);
+        if let Some(font) = &config.font {
+            dev.texter = TextRenderer::load_from_file(&font.path, font.size)?;
         }
 
-        // Handle tray menu events
+        dev.set_shift_mode(config.oled_shift.to_api());
+        dev.play();
+
+        Ok(RuntimeState {
+            capabilities,
+            config,
+            tray,
+            dev,
+            mgr: MediaControl::new(),
+            last_time: Local::now() - TimeDelta::seconds(1),
+            last_media: None,
+            time_layers: vec![],
+            media_layers: vec![],
+            notif_layer: None,
+            notif_expiry: Local::now(),
+            is_connected: None,
+            needs_redraw: false,
+            icon_hs_connect,
+            icon_hs_disconnect,
+        })
+    }
+
+    fn save_config(&self) -> anyhow::Result<()> {
+        self.config.save()
+    }
+
+    fn handle_menu_event(&mut self, event: MenuEvent) -> bool {
+        if event.id == self.tray.tm_quit.id() {
+            return true;
+        }
+
         let mut config_updated = false;
-        while let Ok(event) = menu_rx.try_recv() {
-            match event {
-                MenuEvent::ToggleCheck => {
-                    config_updated = true;
-                    config.show_time = unsafe { sdl::SDL_GetTrayEntryChecked(tm_time_check) };
-                    config.show_media = unsafe { sdl::SDL_GetTrayEntryChecked(tm_media_check) };
-                    config.show_notifications = unsafe { sdl::SDL_GetTrayEntryChecked(tm_notif_check) };
-                    config.idle_timeout = unsafe { sdl::SDL_GetTrayEntryChecked(tm_idle_check) };
-                }
-                MenuEvent::SetShiftMode(mode) => {
-                    config_updated = true;
-                    config.oled_shift = mode;
-                    unsafe { sdl::SDL_SetTrayEntryChecked(tm_shift_off, matches!(mode, ConfigShiftMode::Off)) };
-                    unsafe { sdl::SDL_SetTrayEntryChecked(tm_shift_simple, matches!(mode, ConfigShiftMode::Simple)) };
-                    dev.set_shift_mode(config.oled_shift.to_api());
-                }
-                MenuEvent::ToggleAutostart => {
-                    config.autostart = !config.autostart;
-                    set_autostart(config.autostart);
-                    unsafe { sdl::SDL_SetTrayEntryChecked(tm_autostart_check, config.autostart) };
-                    config_updated = true;
-                }
-                MenuEvent::Quit => break 'main,
+
+        if event.id == self.tray.tm_time_check.id()
+            || event.id == self.tray.tm_media_check.id()
+            || event.id == self.tray.tm_media_paused_check.id()
+            || event.id == self.tray.tm_notif_check.id()
+            || event.id == self.tray.tm_idle_check.id()
+        {
+            self.config.show_time = self.tray.tm_time_check.is_checked();
+            self.config.show_media = self.capabilities.media && self.tray.tm_media_check.is_checked();
+            self.config.show_media_paused = self.capabilities.media && self.tray.tm_media_paused_check.is_checked();
+            self.config.show_notifications = self.tray.tm_notif_check.is_checked();
+            self.config.idle_timeout = self.capabilities.idle_timeout && self.tray.tm_idle_check.is_checked();
+            config_updated = true;
+        }
+
+        if event.id == self.tray.tm_shift_off.id() {
+            self.config.oled_shift = ConfigShiftMode::Off;
+            self.tray.tm_shift_off.set_checked(true);
+            self.tray.tm_shift_simple.set_checked(false);
+            self.dev.set_shift_mode(self.config.oled_shift.to_api());
+            config_updated = true;
+        }
+
+        if event.id == self.tray.tm_shift_simple.id() {
+            self.config.oled_shift = ConfigShiftMode::Simple;
+            self.tray.tm_shift_off.set_checked(false);
+            self.tray.tm_shift_simple.set_checked(true);
+            self.dev.set_shift_mode(self.config.oled_shift.to_api());
+            config_updated = true;
+        }
+
+        if event.id == self.tray.tm_autostart_check.id() && self.capabilities.autostart {
+            self.config.autostart = self.tray.tm_autostart_check.is_checked();
+            set_autostart(self.config.autostart);
+            config_updated = true;
+        }
+
+        if config_updated {
+            self.needs_redraw = true;
+            if let Err(err) = self.save_config() {
+                show_error_dialog(&format!("Error saving config: {err:?}"));
             }
         }
-        if config_updated {
-            dialog_unwrap(config.save());
-        }
 
-        let mut force_redraw = config_updated;
+        false
+    }
 
-        // Handle events
-        while let Some(event) = dev.try_event() {
+    fn tick(&mut self) {
+        let mut force_redraw = std::mem::take(&mut self.needs_redraw);
+
+        while let Some(event) = self.dev.try_event() {
             println!("event: {:?}", event);
             match event {
-                DrawEvent::DeviceDisconnected => unsafe { sdl::SDL_SetTrayIcon(tray, icon_error.surf) },
-                DrawEvent::DeviceReconnected => unsafe { sdl::SDL_SetTrayIcon(tray, icon.surf) },
+                DrawEvent::DeviceDisconnected => _ = self.tray.tray.set_icon(Some(self.tray.icon_error.clone())),
+                DrawEvent::DeviceReconnected => _ = self.tray.tray.set_icon(Some(self.tray.icon_ok.clone())),
                 #[allow(clippy::single_match)]
                 DrawEvent::DeviceEvent(event) => match event {
                     ggoled_lib::DeviceEvent::HeadsetConnection { wireless, .. } => {
-                        if Some(wireless) != is_connected {
-                            is_connected = Some(wireless);
-                            if config.show_notifications {
-                                if let Some(id) = notif_layer {
-                                    dev.remove_layer(id);
+                        if Some(wireless) != self.is_connected {
+                            self.is_connected = Some(wireless);
+                            if self.config.show_notifications {
+                                if let Some(id) = self.notif_layer {
+                                    self.dev.remove_layer(id);
                                 }
-                                notif_layer = Some(
-                                    dev.add_layer(ggoled_draw::DrawLayer::Image {
+                                self.notif_layer = Some(
+                                    self.dev.add_layer(ggoled_draw::DrawLayer::Image {
                                         bitmap: (if wireless {
-                                            &icon_hs_connect
+                                            &self.icon_hs_connect
                                         } else {
-                                            &icon_hs_disconnect
+                                            &self.icon_hs_disconnect
                                         })
                                         .clone(),
                                         x: 8,
                                         y: 8,
                                     }),
                                 );
-                                notif_expiry = Local::now() + NOTIF_DUR;
+                                self.notif_expiry = Local::now() + TimeDelta::from_std(NOTIF_DUR).unwrap();
                                 force_redraw = true;
                             }
                         }
@@ -333,57 +265,210 @@ fn main() {
             }
         }
 
-        // Update layers every second
         let time = Local::now();
-        if time.second() != last_time.second() || force_redraw {
-            last_time = time;
+        if time.second() == self.last_time.second() && !force_redraw {
+            return;
+        }
+        self.last_time = time;
 
-            // Remove expired notifications
-            if let Some(id) = notif_layer {
-                if time >= notif_expiry {
-                    dev.remove_layer(id);
-                    notif_layer = None;
-                }
-            }
-
-            // Check if idle
-            let idle_seconds = get_idle_seconds();
-            if config.idle_timeout && idle_seconds >= IDLE_TIMEOUT_SECS {
-                // TODO: perhaps notifications should be kept?
-                dev.clear_layers(); // clear screen when idle
-                last_media = None; // reset media so we check again when not idle
-            } else {
-                // Fetch media once a second (before pausing screen)
-                let media = if config.show_media { mgr.get_media() } else { None };
-
-                dev.pause();
-
-                // Time
-                dev.remove_layers(&time_layers);
-                if config.show_time {
-                    let time_str = time.format("%I:%M:%S %p").to_string();
-                    time_layers = dev.add_text(&time_str, None, if media.is_some() { Some(8) } else { None });
-                }
-
-                // Media
-                if media != last_media {
-                    dev.remove_layers(&media_layers);
-                    if let Some(m) = &media {
-                        media_layers = dev.add_text(
-                            &format!("{}\n{}", m.title, m.artist),
-                            None,
-                            Some(8 + dev.font_line_height() as isize),
-                        );
-                    }
-                    last_media = media;
-                }
-
-                dev.play();
+        if let Some(id) = self.notif_layer {
+            if time >= self.notif_expiry {
+                self.dev.remove_layer(id);
+                self.notif_layer = None;
             }
         }
 
-        sleep(Duration::from_millis(10));
+        let idle_seconds = get_idle_seconds();
+        if self.config.idle_timeout && idle_seconds >= IDLE_TIMEOUT_SECS {
+            self.dev.clear_layers();
+            self.last_media = None;
+            return;
+        }
+
+        let media = if self.config.show_media {
+            self.mgr.get_media(self.config.show_media_paused)
+        } else {
+            None
+        };
+
+        self.dev.pause();
+
+        self.dev.remove_layers(&self.time_layers);
+        if self.config.show_time {
+            let time_str = time.format("%I:%M:%S %p").to_string();
+            self.time_layers = self
+                .dev
+                .add_text(&time_str, None, if media.is_some() { Some(8) } else { None });
+        }
+
+        if media != self.last_media {
+            self.dev.remove_layers(&self.media_layers);
+            if let Some(m) = &media {
+                self.media_layers = self.dev.add_text(
+                    &format!("{}\n{}", m.title, m.artist),
+                    None,
+                    Some(8 + self.dev.font_line_height() as isize),
+                );
+            }
+            self.last_media = media;
+        }
+
+        self.dev.play();
     }
-    let dev = dev.stop();
-    dev.return_to_ui().unwrap();
+
+    fn shutdown(self) {
+        let dev = self.dev.stop();
+        _ = dev.return_to_ui();
+    }
+}
+
+fn load_tray_icon(buf: &[u8]) -> anyhow::Result<TrayIconImage> {
+    let pixels = image::load_from_memory(buf)?
+        .resize(32, 32, image::imageops::FilterType::Lanczos3)
+        .to_rgba8()
+        .into_vec();
+    let icon = TrayIconImage::from_rgba(pixels, 32, 32)?;
+    Ok(icon)
+}
+
+fn create_tray(config: &Config, capabilities: PlatformCapabilities) -> anyhow::Result<TrayState> {
+    let icon_ok = load_tray_icon(include_bytes!("../assets/ggoled.png"))?;
+    let icon_error = load_tray_icon(include_bytes!("../assets/ggoled_error.png"))?;
+
+    let menu = Menu::new();
+
+    let tm_time_check = CheckMenuItem::new("Show time", true, config.show_time, None);
+    let tm_media_check = CheckMenuItem::new("Show playing media", true, config.show_media, None);
+    let tm_media_paused_check = CheckMenuItem::new("Show paused media", true, config.show_media_paused, None);
+    let tm_notif_check = CheckMenuItem::new("Show connection notifications", true, config.show_notifications, None);
+    let tm_idle_check = CheckMenuItem::new("Screensaver when idle", true, config.idle_timeout, None);
+    let tm_autostart_check = CheckMenuItem::new("Start at login", true, config.autostart, None);
+
+    menu.append(&tm_time_check)?;
+    menu.append(&tm_media_check)?;
+    menu.append(&tm_media_paused_check)?;
+    menu.append(&tm_notif_check)?;
+    menu.append(&tm_idle_check)?;
+    menu.append(&tm_autostart_check)?;
+
+    let tm_shift_submenu = Submenu::new("OLED screen shift", true);
+    let tm_shift_off = CheckMenuItem::new("Off", true, matches!(config.oled_shift, ConfigShiftMode::Off), None);
+    let tm_shift_simple = CheckMenuItem::new(
+        "Simple",
+        true,
+        matches!(config.oled_shift, ConfigShiftMode::Simple),
+        None,
+    );
+    tm_shift_submenu.append(&tm_shift_off)?;
+    tm_shift_submenu.append(&tm_shift_simple)?;
+    menu.append(&tm_shift_submenu)?;
+
+    let tm_quit = MenuItem::new("Quit", true, None);
+    menu.append(&tm_quit)?;
+
+    if !capabilities.media {
+        tm_media_check.set_checked(false);
+        tm_media_check.set_enabled(false);
+        tm_media_paused_check.set_checked(false);
+        tm_media_paused_check.set_enabled(false);
+    }
+    if !capabilities.idle_timeout {
+        tm_idle_check.set_checked(false);
+        tm_idle_check.set_enabled(false);
+    }
+    if !capabilities.autostart {
+        tm_autostart_check.set_checked(false);
+        tm_autostart_check.set_enabled(false);
+    }
+
+    let tray = TrayIconBuilder::new()
+        .with_tooltip("ggoled")
+        .with_icon(icon_ok.clone())
+        .with_menu(Box::new(menu))
+        .build()?;
+
+    Ok(TrayState {
+        tray,
+        icon_ok,
+        icon_error,
+        tm_time_check,
+        tm_media_check,
+        tm_media_paused_check,
+        tm_notif_check,
+        tm_idle_check,
+        tm_autostart_check,
+        tm_shift_off,
+        tm_shift_simple,
+        tm_quit,
+    })
+}
+
+fn main() {
+    let mut config = Config::load();
+    let capabilities = capabilities();
+
+    config.show_media = config.show_media && capabilities.media;
+    config.show_media_paused = config.show_media_paused && capabilities.media;
+    config.idle_timeout = config.idle_timeout && capabilities.idle_timeout;
+    config.autostart = if capabilities.autostart { get_autostart() } else { false };
+
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+
+    let proxy = event_loop.create_proxy();
+    MenuEvent::set_event_handler(Some(move |event| {
+        _ = proxy.send_event(UserEvent::MenuEvent(event));
+    }));
+
+    let mut runtime: Option<RuntimeState> = None;
+    let mut initial_config = Some(config);
+
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::WaitUntil(std::time::Instant::now() + TICK_DUR);
+
+        match event {
+            Event::NewEvents(StartCause::Init) => {
+                let Some(config) = initial_config.take() else {
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                };
+                let tray = match create_tray(&config, capabilities) {
+                    Ok(tray) => tray,
+                    Err(err) => {
+                        show_error_dialog(&format!("Error creating tray: {err:?}"));
+                        *control_flow = ControlFlow::Exit;
+                        return;
+                    }
+                };
+                match RuntimeState::new(config, capabilities, tray) {
+                    Ok(state) => runtime = Some(state),
+                    Err(err) => {
+                        show_error_dialog(&format!("Error: {err:?}"));
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::MenuEvent(event)) => {
+                if let Some(state) = runtime.as_mut() {
+                    let should_quit = state.handle_menu_event(event);
+                    if should_quit {
+                        if let Some(state) = runtime.take() {
+                            state.shutdown();
+                        }
+                        *control_flow = ControlFlow::Exit;
+                    }
+                }
+            }
+            Event::MainEventsCleared => {
+                if let Some(state) = runtime.as_mut() {
+                    state.tick();
+                }
+            }
+            Event::LoopDestroyed => {
+                if let Some(state) = runtime.take() {
+                    state.shutdown();
+                }
+            }
+            _ => {}
+        }
+    });
 }

@@ -1,5 +1,13 @@
-use super::Media;
+use super::{Media, PlatformCapabilities};
 use mpris::{PlaybackStatus, PlayerFinder};
+
+pub fn capabilities() -> PlatformCapabilities {
+    PlatformCapabilities {
+        media: true,
+        idle_timeout: false,
+        autostart: false,
+    }
+}
 
 pub struct MediaControl {
     pf: Option<PlayerFinder>,
@@ -15,11 +23,13 @@ impl MediaControl {
         };
         MediaControl { pf }
     }
-    pub fn get_media(&self) -> Option<Media> {
+    pub fn get_media(&self, include_paused: bool) -> Option<Media> {
         let pf = self.pf.as_ref()?;
         let player = pf.find_active().ok()?;
         let status = player.get_playback_status().ok()?;
-        if !matches!(status, PlaybackStatus::Playing) {
+        let allowed =
+            matches!(status, PlaybackStatus::Playing) || (include_paused && matches!(status, PlaybackStatus::Paused));
+        if !allowed {
             return None;
         }
         let meta = player.get_metadata().ok()?;
@@ -36,4 +46,10 @@ impl MediaControl {
 pub fn get_idle_seconds() -> usize {
     // TODO
     0
+}
+
+pub fn set_autostart(_enabled: bool) {}
+
+pub fn get_autostart() -> bool {
+    false
 }

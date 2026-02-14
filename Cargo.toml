@@ -5,6 +5,7 @@ members = [
     "ggoled_lib",
     "ggoled_draw",
     "ggoled_app",
+    "xtask",
 ]
 
 [profile.release]

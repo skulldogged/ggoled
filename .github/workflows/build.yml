@@ -1,8 +1,8 @@
 name: Build
 on: [push, pull_request]
 jobs:
-  release:
-    name: Release - ${{ matrix.platform.target }}
+  windows-release:
+    name: Release (Windows) - ${{ matrix.platform.target }}
     strategy:
       matrix:
         platform:
@@ -36,3 +36,43 @@ jobs:
           path: |
             target/${{ matrix.platform.target }}/release/${{ matrix.platform.cli }}
             target/${{ matrix.platform.target }}/release/${{ matrix.platform.app }}
+
+  macos-release:
+    name: Release (macOS) - ${{ matrix.platform.target }}
+    strategy:
+      matrix:
+        platform:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            app: ggoled_app
+          - os: macos-13
+            target: x86_64-apple-darwin
+            app: ggoled_app
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Cache
+        uses: actions/cache@v4
+        with:
+          key: ${{ matrix.platform.target }}-${{ matrix.platform.os }}
+          path: |
+            ~/.cargo
+            target
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.platform.target }}
+      - name: Build ggoled_app (signed)
+        run: cargo xtask build-macos --target ${{ matrix.platform.target }}
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.platform.target }}/release/${{ matrix.platform.app }} dist/${{ matrix.platform.app }}
+          cd dist
+          zip -9 ggoled_app-${{ matrix.platform.target }}.zip ${{ matrix.platform.app }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ggoled_app-${{ matrix.platform.target }}
+          path: dist/ggoled_app-${{ matrix.platform.target }}.zip

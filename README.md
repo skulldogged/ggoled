@@ -4,7 +4,7 @@ Put custom graphics on your SteelSeries Arctis Nova Pro Base Station 128x64 OLED
 
 This utility implements the USB protocol, so you don't need SteelSeries GG/Engine Apps/GameSense, and it works on linux.
 
-There is also a [desktop application](#desktop-application) available for Windows and Linux that shows the current time and currently playing media, along with some other features.
+There is also a [desktop application](#desktop-application) available for Windows, Linux, and macOS that shows the current time and currently playing media, along with some other features.
 
 ## Animation showcase
 
@@ -30,6 +30,11 @@ PRs and issues for similar devices are welcome!
 ## Install
 
 For Windows you can download the latest builds either from [GitHub Actions](https://github.com/JerwuQu/ggoled/actions?query=branch%3Amaster) or from [nightly.link (direct download)](https://nightly.link/JerwuQu/ggoled/workflows/build/master/x86_64-pc-windows-gnu.zip).
+
+For macOS desktop app builds, download one of these artifacts from [GitHub Actions](https://github.com/JerwuQu/ggoled/actions?query=branch%3Amaster):
+
+- `ggoled_app-aarch64-apple-darwin` (Apple Silicon)
+- `ggoled_app-x86_64-apple-darwin` (Intel)
 
 Otherwise, install the Rust toolchain and run: `cargo install --locked --git https://github.com/JerwuQu/ggoled.git ggoled ggoled_app`
 
@@ -57,12 +62,34 @@ ggoled anim -r 20 $(Get-ChildItem frames | % { $_.FullName })  # powershell
 
 The application puts itself as an icon in the system tray that you can right-click to configure.
 
-For Windows, it gets media information from the Windows API which makes it work with almost all applications (with some limitations).
+Media integration:
+
+- Windows: uses the Windows media session API.
+- Linux: uses MPRIS.
+- macOS: uses MediaRemote.
+
+On newer macOS versions, MediaRemote access can be restricted for unsigned binaries. `cargo xtask build-macos` builds and codesigns with a `com.apple*` identifier by default.
 
 There are also features to avoid OLED burn-in that is otherwise unavoidable when using the official software, such as the screensaver function which will turn off the OLED display when away from the computer, or the OLED shifter which will infrequently move things around slightly.
 To extend the lifespan of your display, both of these are strongly recommended to use, along with using a low screen brightness.
 
-### systemd service
+Start-at-login is currently supported on Windows and macOS.
+
+### macOS build (includes com.apple signing)
+
+`cargo xtask build-macos` builds both macOS targets and signs them:
+
+```sh
+cargo xtask build-macos
+```
+
+You can override bundle identifier and identity (identifier must still start with `com.apple`):
+
+```sh
+cargo xtask build-macos --bundle-id com.apple.ggoled.app --codesign-identity "Developer ID Application: YOUR NAME (TEAMID)"
+```
+
+### Linux systemd service
 
 ```sh
 mkdir -p ~/.config/systemd/user/
@@ -75,11 +102,23 @@ systemctl --user enable --now ggoled_app.service
 
 It's recommended to use bitmap fonts to avoid weird artifacting, but any TTF or OTF font should work.
 
-Modify the `%appdata%\ggoled_app.toml` file and add:
+Modify your platform config file and add:
+
+- Windows: `%APPDATA%\ggoled_app.toml`
+- Linux: `~/.config/ggoled_app.toml`
+- macOS: `~/Library/Application Support/ggoled_app.toml`
 
 ```toml
 [font]
 path = 'C:\Path\To\Font.ttf'
+size = 16.0
+```
+
+or on Unix-like systems:
+
+```toml
+[font]
+path = '/Path/To/Font.ttf'
 size = 16.0
 ```
 
