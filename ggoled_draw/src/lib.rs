@@ -62,6 +62,41 @@ impl TextRenderer {
             FontInner::Bdf { font } => font.bounds().height as usize,
         }
     }
+    pub fn measure_line_widths(&self, text: &str) -> Vec<usize> {
+        let clean_text = text.replace('\r', "");
+        let text_lines = clean_text.split('\n');
+        match &self.inner {
+            FontInner::Ttf { font, size } => {
+                let scale = Scale::uniform(*size);
+                text_lines
+                    .map(|text_line| {
+                        let glyphs: Vec<_> = font.layout(text_line, scale, point(0.0, 0.0)).collect();
+                        let mut line_w_offset = 0;
+                        let mut line_w = 0;
+                        for bb in glyphs.iter().filter_map(|g| g.pixel_bounding_box()) {
+                            line_w_offset = line_w_offset.max(-bb.min.x);
+                            line_w = line_w.max(bb.max.x + 1);
+                        }
+                        (line_w + line_w_offset) as usize
+                    })
+                    .collect()
+            }
+            FontInner::Bdf { font } => {
+                let bounds = font.bounds();
+                text_lines
+                    .map(|text_line| {
+                        let mut cursor_x: i32 = 0;
+                        for ch in text_line.chars() {
+                            if let Some(glyph) = font.glyphs().get(&ch) {
+                                cursor_x += glyph.device_width().unwrap_or(&(bounds.width, 0)).0 as i32;
+                            }
+                        }
+                        cursor_x.max(0) as usize
+                    })
+                    .collect()
+            }
+        }
+    }
     pub fn render_lines(&self, text: &str) -> Vec<Bitmap> {
         let clean_text = text.replace('\r', "");
         let text_lines = clean_text.split('\n');
@@ -226,6 +261,12 @@ pub enum DrawLayer {
     },
 }
 
+#[derive(Clone, Copy)]
+pub enum TextOverflowMode {
+    Scroll,
+    Clip,
+}
+
 pub enum ShiftMode {
     Off,
     Simple,
@@ -261,6 +302,21 @@ struct DrawLayerState {
     scroll: ScrollState,
 }
 
+enum RenderOp {
+    Blit {
+        bitmap: Arc<Bitmap>,
+        x: isize,
+        y: isize,
+    },
+    Scroll {
+        bitmap: Arc<Bitmap>,
+        x: isize,
+        y: isize,
+        scroll_w: isize,
+        dupes: usize,
+    },
+}
+
 const OLED_SHIFT_PERIOD: Duration = Duration::from_secs(90);
 const OLED_SHIFTS: [(isize, isize); 9] = [
     (0, 0),
@@ -276,6 +332,122 @@ const OLED_SHIFTS: [(isize, isize); 9] = [
 
 const RECONNECT_PERIOD: Duration = Duration::from_secs(1);
 const SCROLL_REVOLUTION_PAUSE: Duration = Duration::from_millis(900);
+const MAX_ANIM_CATCHUP_STEPS: usize = 8;
+
+fn add_layer_to_map(layer_counter: &mut usize, layers: &mut LayerMap, layer: DrawLayer) -> LayerId {
+    *layer_counter += 1;
+    let id = LayerId(*layer_counter);
+    _ = layers.insert(
+        id,
+        DrawLayerState {
+            layer,
+            anim: AnimState {
+                ticks: 0,
+                next_update: Instant::now(),
+            },
+            scroll: ScrollState {
+                x: 0,
+                pause_until: None,
+            },
+        },
+    );
+    id
+}
+
+fn add_text_layers(
+    texter: &TextRenderer,
+    width: usize,
+    height: usize,
+    layer_counter: &mut usize,
+    layers: &mut LayerMap,
+    text: &str,
+    x: Option<isize>,
+    y: Option<isize>,
+    shift: bool,
+    mode: TextOverflowMode,
+) -> Vec<LayerId> {
+    let bitmaps: Vec<_> = texter.render_lines(text).into_iter().map(Arc::new).collect();
+    let line_height = texter.line_height();
+    let center_y: isize = (height as isize - (line_height * bitmaps.len()) as isize) / 2;
+    bitmaps
+        .into_iter()
+        .enumerate()
+        .map(|(i, bitmap)| {
+            let y = y.unwrap_or(center_y) + (i * line_height) as isize;
+            let center_x = (width as isize - bitmap.w as isize) / 2;
+            if bitmap.w >= width && matches!(mode, TextOverflowMode::Scroll) {
+                add_layer_to_map(
+                    layer_counter,
+                    layers,
+                    if shift {
+                        DrawLayer::Scroll { bitmap, y }
+                    } else {
+                        DrawLayer::ScrollNoShift { bitmap, y }
+                    },
+                )
+            } else {
+                add_layer_to_map(
+                    layer_counter,
+                    layers,
+                    if shift {
+                        DrawLayer::Image {
+                            bitmap,
+                            x: x.unwrap_or(center_x),
+                            y,
+                        }
+                    } else {
+                        DrawLayer::ImageNoShift {
+                            bitmap,
+                            x: x.unwrap_or(center_x),
+                            y,
+                        }
+                    },
+                )
+            }
+        })
+        .collect()
+}
+
+fn normalize_anim_delay(delay: Option<Duration>, fallback_delay: Duration) -> Duration {
+    let delay = delay.unwrap_or(fallback_delay);
+    if delay.is_zero() {
+        fallback_delay
+    } else {
+        delay
+    }
+}
+
+fn advance_animation_state(
+    anim: &mut AnimState,
+    frames: &[Frame],
+    follow_fps: bool,
+    now: Instant,
+    fallback_delay: Duration,
+) -> Option<usize> {
+    if frames.is_empty() {
+        return None;
+    }
+    let render_idx = anim.ticks % frames.len();
+    if follow_fps {
+        anim.ticks = anim.ticks.wrapping_add(1);
+        return Some(render_idx);
+    }
+
+    if now >= anim.next_update {
+        let mut steps = 0;
+        while now >= anim.next_update && steps < MAX_ANIM_CATCHUP_STEPS {
+            let idx = anim.ticks % frames.len();
+            let delay = normalize_anim_delay(frames[idx].delay, fallback_delay);
+            anim.ticks = anim.ticks.wrapping_add(1);
+            anim.next_update += delay;
+            steps += 1;
+        }
+        if now >= anim.next_update {
+            anim.next_update = now + fallback_delay;
+        }
+    }
+    Some(render_idx)
+}
 
 fn run_draw_device_thread(
     mut dev: Device,
@@ -334,73 +506,99 @@ fn run_draw_device_thread(
                 }
             };
 
-            // Update and blit each layer to the screen
+            let mut render_ops = vec![];
+            {
+                let mut layers = layers.lock().unwrap();
+                render_ops.reserve(layers.len());
+                for state in layers.values_mut() {
+                    match &state.layer {
+                        DrawLayer::Image { bitmap, x, y } => render_ops.push(RenderOp::Blit {
+                            bitmap: bitmap.clone(),
+                            x: x + shift_x,
+                            y: y + shift_y,
+                        }),
+                        DrawLayer::ImageNoShift { bitmap, x, y } => render_ops.push(RenderOp::Blit {
+                            bitmap: bitmap.clone(),
+                            x: *x,
+                            y: *y,
+                        }),
+                        DrawLayer::Animation {
+                            frames,
+                            x,
+                            y,
+                            follow_fps,
+                        } => {
+                            if let Some(frame_idx) =
+                                advance_animation_state(&mut state.anim, frames, *follow_fps, time, frame_delay)
+                            {
+                                render_ops.push(RenderOp::Blit {
+                                    bitmap: frames[frame_idx].bitmap.clone(),
+                                    x: x + shift_x,
+                                    y: y + shift_y,
+                                });
+                            }
+                        }
+                        DrawLayer::Scroll { bitmap, y } => {
+                            const MARGIN: isize = 30;
+                            let scroll_w = bitmap.w as isize + MARGIN;
+                            let dupes = 1 + dev.width / scroll_w as usize;
+                            render_ops.push(RenderOp::Scroll {
+                                bitmap: bitmap.clone(),
+                                x: state.scroll.x + shift_x,
+                                y: *y + shift_y,
+                                scroll_w,
+                                dupes,
+                            });
+                            let paused = state.scroll.pause_until.is_some_and(|until| time < until);
+                            if !paused {
+                                state.scroll.x -= 1;
+                                if state.scroll.x <= -scroll_w {
+                                    state.scroll.x += scroll_w;
+                                    state.scroll.pause_until = Some(time + SCROLL_REVOLUTION_PAUSE);
+                                }
+                            } else if state.scroll.pause_until.is_some_and(|until| time >= until) {
+                                state.scroll.pause_until = None;
+                            }
+                        }
+                        DrawLayer::ScrollNoShift { bitmap, y } => {
+                            const MARGIN: isize = 30;
+                            let scroll_w = bitmap.w as isize + MARGIN;
+                            let dupes = 1 + dev.width / scroll_w as usize;
+                            render_ops.push(RenderOp::Scroll {
+                                bitmap: bitmap.clone(),
+                                x: state.scroll.x,
+                                y: *y,
+                                scroll_w,
+                                dupes,
+                            });
+                            let paused = state.scroll.pause_until.is_some_and(|until| time < until);
+                            if !paused {
+                                state.scroll.x -= 1;
+                                if state.scroll.x <= -scroll_w {
+                                    state.scroll.x += scroll_w;
+                                    state.scroll.pause_until = Some(time + SCROLL_REVOLUTION_PAUSE);
+                                }
+                            } else if state.scroll.pause_until.is_some_and(|until| time >= until) {
+                                state.scroll.pause_until = None;
+                            }
+                        }
+                    }
+                }
+            }
+
             let mut screen = Bitmap::new(dev.width, dev.height, false);
-            let mut layers = layers.lock().unwrap();
-            for (_, state) in layers.iter_mut() {
-                match &state.layer {
-                    DrawLayer::Image { bitmap, x, y } => screen.blit(bitmap, x + shift_x, y + shift_y, false),
-                    DrawLayer::ImageNoShift { bitmap, x, y } => screen.blit(bitmap, *x, *y, false),
-                    DrawLayer::Animation {
-                        frames,
+            for op in render_ops {
+                match op {
+                    RenderOp::Blit { bitmap, x, y } => screen.blit(&bitmap, x, y, false),
+                    RenderOp::Scroll {
+                        bitmap,
                         x,
                         y,
-                        follow_fps,
+                        scroll_w,
+                        dupes,
                     } => {
-                        if !frames.is_empty() {
-                            let frame = &frames[state.anim.ticks % frames.len()];
-                            screen.blit(&frame.bitmap, x + shift_x, y + shift_y, false);
-                            if *follow_fps {
-                                state.anim.ticks += 1;
-                            } else if time >= state.anim.next_update {
-                                state.anim.ticks += 1;
-                                // TODO: handle 0 delay frames properly
-                                // TODO: handle falling behind
-                                if let Some(delay) = frame.delay {
-                                    state.anim.next_update += delay;
-                                }
-                            }
-                        }
-                    }
-                    DrawLayer::Scroll { bitmap, y } => {
-                        const MARGIN: isize = 30;
-                        let scroll_w = bitmap.w as isize + MARGIN;
-                        let dupes = 1 + dev.width / scroll_w as usize;
                         for i in 0..=dupes {
-                            screen.blit(
-                                bitmap,
-                                state.scroll.x + i as isize * scroll_w + shift_x,
-                                *y + shift_y,
-                                false,
-                            );
-                        }
-                        let paused = state.scroll.pause_until.is_some_and(|until| time < until);
-                        if !paused {
-                            state.scroll.x -= 1;
-                            if state.scroll.x <= -scroll_w {
-                                state.scroll.x += scroll_w;
-                                state.scroll.pause_until = Some(time + SCROLL_REVOLUTION_PAUSE);
-                            }
-                        } else if state.scroll.pause_until.is_some_and(|until| time >= until) {
-                            state.scroll.pause_until = None;
-                        }
-                    }
-                    DrawLayer::ScrollNoShift { bitmap, y } => {
-                        const MARGIN: isize = 30;
-                        let scroll_w = bitmap.w as isize + MARGIN;
-                        let dupes = 1 + dev.width / scroll_w as usize;
-                        for i in 0..=dupes {
-                            screen.blit(bitmap, state.scroll.x + i as isize * scroll_w, *y, false);
-                        }
-                        let paused = state.scroll.pause_until.is_some_and(|until| time < until);
-                        if !paused {
-                            state.scroll.x -= 1;
-                            if state.scroll.x <= -scroll_w {
-                                state.scroll.x += scroll_w;
-                                state.scroll.pause_until = Some(time + SCROLL_REVOLUTION_PAUSE);
-                            }
-                        } else if state.scroll.pause_until.is_some_and(|until| time >= until) {
-                            state.scroll.pause_until = None;
+                            screen.blit(&bitmap, x + i as isize * scroll_w, y, false);
                         }
                     }
                 }
@@ -420,7 +618,6 @@ fn run_draw_device_thread(
                     prev_screen = screen;
                 }
             }
-            drop(layers);
         }
 
         // Get device events and pass back to DrawDevice
@@ -459,6 +656,52 @@ pub struct DrawDevice {
     event_receiver: Receiver<DrawEvent>,
     pub texter: TextRenderer,
 }
+
+pub struct LayerTxn<'a> {
+    width: usize,
+    height: usize,
+    layer_counter: &'a mut usize,
+    layers: MutexGuard<'a, LayerMap>,
+    texter: &'a TextRenderer,
+}
+impl<'a> LayerTxn<'a> {
+    pub fn add_layer(&mut self, layer: DrawLayer) -> LayerId {
+        add_layer_to_map(self.layer_counter, &mut self.layers, layer)
+    }
+    pub fn remove_layer(&mut self, id: LayerId) {
+        self.layers.remove(&id);
+    }
+    pub fn remove_layers(&mut self, ids: &[LayerId]) {
+        for id in ids {
+            self.layers.remove(id);
+        }
+    }
+    pub fn clear_layers(&mut self) {
+        self.layers.clear();
+    }
+    pub fn add_text_with_mode(
+        &mut self,
+        text: &str,
+        x: Option<isize>,
+        y: Option<isize>,
+        shift: bool,
+        mode: TextOverflowMode,
+    ) -> Vec<LayerId> {
+        add_text_layers(
+            self.texter,
+            self.width,
+            self.height,
+            self.layer_counter,
+            &mut self.layers,
+            text,
+            x,
+            y,
+            shift,
+            mode,
+        )
+    }
+}
+
 impl DrawDevice {
     pub fn new(dev: Device, fps: usize) -> DrawDevice {
         let layers: Arc<Mutex<LayerMap>> = Default::default();
@@ -503,27 +746,9 @@ impl DrawDevice {
             (self.height as isize - bitmap.h as isize) / 2,
         )
     }
-    fn add_layer_locked(&mut self, layers: &mut MutexGuard<'_, LayerMap>, layer: DrawLayer) -> LayerId {
-        self.layer_counter += 1;
-        let id = LayerId(self.layer_counter);
-        _ = layers.insert(
-            id,
-            DrawLayerState {
-                layer,
-                anim: AnimState {
-                    ticks: 0,
-                    next_update: Instant::now(),
-                },
-                scroll: ScrollState {
-                    x: 0,
-                    pause_until: None,
-                },
-            },
-        );
-        id
-    }
     pub fn add_layer(&mut self, layer: DrawLayer) -> LayerId {
-        self.add_layer_locked(&mut self.layers.clone().lock().unwrap(), layer)
+        let mut layers = self.layers.lock().unwrap();
+        add_layer_to_map(&mut self.layer_counter, &mut layers, layer)
     }
     pub fn remove_layer(&mut self, id: LayerId) {
         self.layers.lock().unwrap().remove(&id);
@@ -540,53 +765,47 @@ impl DrawDevice {
     pub fn font_line_height(&self) -> usize {
         self.texter.line_height()
     }
-    fn add_text_inner(&mut self, text: &str, x: Option<isize>, y: Option<isize>, shift: bool) -> Vec<LayerId> {
-        let layers = self.layers.clone();
-        let mut layers = layers.lock().unwrap();
-        let bitmaps: Vec<_> = self.texter.render_lines(text).into_iter().map(Arc::new).collect();
-        let line_height = self.texter.line_height();
-        let center_y: isize = (self.height as isize - (line_height * bitmaps.len()) as isize) / 2;
-        bitmaps
-            .into_iter()
-            .enumerate()
-            .map(|(i, bitmap)| {
-                let y = y.unwrap_or(center_y) + (i * line_height) as isize;
-                if bitmap.w >= self.width {
-                    self.add_layer_locked(
-                        &mut layers,
-                        if shift {
-                            DrawLayer::Scroll { bitmap, y }
-                        } else {
-                            DrawLayer::ScrollNoShift { bitmap, y }
-                        },
-                    )
-                } else {
-                    let center = self.center_bitmap(&bitmap);
-                    self.add_layer_locked(
-                        &mut layers,
-                        if shift {
-                            DrawLayer::Image {
-                                bitmap,
-                                x: x.unwrap_or(center.0),
-                                y,
-                            }
-                        } else {
-                            DrawLayer::ImageNoShift {
-                                bitmap,
-                                x: x.unwrap_or(center.0),
-                                y,
-                            }
-                        },
-                    )
-                }
-            })
-            .collect()
+    pub fn measure_line_widths(&self, text: &str) -> Vec<usize> {
+        self.texter.measure_line_widths(text)
+    }
+    pub fn transact_layers<R>(&mut self, f: impl FnOnce(&mut LayerTxn<'_>) -> R) -> R {
+        let layers = self.layers.lock().unwrap();
+        let mut txn = LayerTxn {
+            width: self.width,
+            height: self.height,
+            layer_counter: &mut self.layer_counter,
+            layers,
+            texter: &self.texter,
+        };
+        f(&mut txn)
+    }
+    pub fn add_text_with_mode(
+        &mut self,
+        text: &str,
+        x: Option<isize>,
+        y: Option<isize>,
+        shift: bool,
+        mode: TextOverflowMode,
+    ) -> Vec<LayerId> {
+        let mut layers = self.layers.lock().unwrap();
+        add_text_layers(
+            &self.texter,
+            self.width,
+            self.height,
+            &mut self.layer_counter,
+            &mut layers,
+            text,
+            x,
+            y,
+            shift,
+            mode,
+        )
     }
     pub fn add_text(&mut self, text: &str, x: Option<isize>, y: Option<isize>) -> Vec<LayerId> {
-        self.add_text_inner(text, x, y, true)
+        self.add_text_with_mode(text, x, y, true, TextOverflowMode::Scroll)
     }
     pub fn add_text_no_shift(&mut self, text: &str, x: Option<isize>, y: Option<isize>) -> Vec<LayerId> {
-        self.add_text_inner(text, x, y, false)
+        self.add_text_with_mode(text, x, y, false, TextOverflowMode::Scroll)
     }
     pub fn set_shift_mode(&mut self, mode: ShiftMode) {
         self.cmd_sender.send(DrawCommand::SetShiftMode(mode)).unwrap();
@@ -594,7 +813,6 @@ impl DrawDevice {
     pub fn set_volume(&mut self, volume: u8) {
         self.cmd_sender.send(DrawCommand::SetVolume(volume)).unwrap();
     }
-    // TODO: atomic layer updates instead of play/pause (use `layers` handle with guard? renderer can use `try_lock` to avoid delaying frames)
     pub fn play(&mut self) {
         self.cmd_sender.send(DrawCommand::Play).unwrap();
     }
@@ -605,5 +823,64 @@ impl DrawDevice {
 impl Drop for DrawDevice {
     fn drop(&mut self) {
         self.destroy();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(delay: Option<Duration>) -> Frame {
+        Frame {
+            bitmap: Arc::new(Bitmap::new(1, 1, true)),
+            delay,
+        }
+    }
+
+    #[test]
+    fn advance_animation_clamps_zero_delay() {
+        let now = Instant::now();
+        let mut anim = AnimState {
+            ticks: 0,
+            next_update: now - Duration::from_millis(1),
+        };
+        let frames = vec![frame(Some(Duration::ZERO))];
+        let fallback = Duration::from_millis(33);
+        let render_idx = advance_animation_state(&mut anim, &frames, false, now, fallback);
+        assert_eq!(render_idx, Some(0));
+        assert_eq!(anim.ticks, 1);
+        assert!(anim.next_update > now);
+    }
+
+    #[test]
+    fn advance_animation_catches_up_when_behind() {
+        let now = Instant::now();
+        let mut anim = AnimState {
+            ticks: 0,
+            next_update: now - Duration::from_millis(35),
+        };
+        let frames = vec![
+            frame(Some(Duration::from_millis(10))),
+            frame(Some(Duration::from_millis(10))),
+        ];
+        let render_idx = advance_animation_state(&mut anim, &frames, false, now, Duration::from_millis(33));
+        assert_eq!(render_idx, Some(0));
+        assert!(anim.ticks >= 2);
+        assert!(anim.ticks <= MAX_ANIM_CATCHUP_STEPS);
+        assert!(anim.next_update > now);
+    }
+
+    #[test]
+    fn advance_animation_bounds_catchup_steps() {
+        let now = Instant::now();
+        let mut anim = AnimState {
+            ticks: 0,
+            next_update: now - Duration::from_secs(10),
+        };
+        let frames = vec![frame(Some(Duration::ZERO))];
+        let fallback = Duration::from_millis(16);
+        let _ = advance_animation_state(&mut anim, &frames, false, now, fallback);
+        assert_eq!(anim.ticks, MAX_ANIM_CATCHUP_STEPS);
+        assert!(anim.next_update >= now + fallback);
     }
 }

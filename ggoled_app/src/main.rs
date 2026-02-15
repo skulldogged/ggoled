@@ -3,7 +3,9 @@
 mod os;
 
 use chrono::{DateTime, Local, TimeDelta, Timelike};
-use ggoled_draw::{bitmap_from_memory, DrawDevice, DrawEvent, DrawLayer, LayerId, ShiftMode, TextRenderer};
+use ggoled_draw::{
+    bitmap_from_memory, DrawDevice, DrawEvent, DrawLayer, LayerId, ShiftMode, TextOverflowMode, TextRenderer,
+};
 use ggoled_lib::Device;
 use os::{capabilities, get_autostart, get_idle_seconds, set_autostart, Media, MediaControl, PlatformCapabilities};
 #[cfg(target_os = "macos")]
@@ -23,7 +25,8 @@ use tray_icon::{
 
 const IDLE_TIMEOUT_SECS: usize = 60;
 const NOTIF_DUR: Duration = Duration::from_secs(5);
-const TICK_DUR: Duration = Duration::from_millis(10);
+const TICK_DUR_FAST: Duration = Duration::from_millis(10);
+const TICK_DUR_NORMAL: Duration = Duration::from_millis(250);
 const BASE_STATION_VOLUME_MAX: u8 = 56;
 const BASE_STATION_VOLUME_STEP: u8 = 4;
 const NOTIF_MARGIN_X: isize = 0;
@@ -343,6 +346,14 @@ impl RuntimeState {
         self.config.save()
     }
 
+    fn tick_duration(&self) -> Duration {
+        if self.config.pass_through_volume_keys {
+            TICK_DUR_FAST
+        } else {
+            TICK_DUR_NORMAL
+        }
+    }
+
     fn clear_notification(&mut self) {
         if !self.notif_layers.is_empty() {
             self.dev.remove_layers(&self.notif_layers);
@@ -358,10 +369,9 @@ impl RuntimeState {
         let text = format!("{percent}");
         let width = self
             .dev
-            .texter
-            .render_lines(&text)
+            .measure_line_widths(&text)
             .first()
-            .map(|line| line.w as isize)
+            .map(|w| *w as isize)
             .unwrap_or(0);
         let icon = self.icon_volume_levels[volume_icon_level(percent)].clone();
         let total_width = icon.w as isize + VOLUME_ICON_GAP + width;
@@ -627,29 +637,40 @@ impl RuntimeState {
             None
         };
 
-        self.dev.pause();
-
-        self.dev.remove_layers(&self.time_layers);
-        if self.config.show_time {
-            let time_str = time.format("%I:%M:%S %p").to_string();
-            self.time_layers = self
-                .dev
-                .add_text(&time_str, None, if media.is_some() { Some(8) } else { None });
-        }
-
-        if media != self.last_media {
-            self.dev.remove_layers(&self.media_layers);
-            if let Some(m) = &media {
-                self.media_layers = self.dev.add_text(
-                    &format!("{}\n{}", m.title, m.artist),
-                    None,
-                    Some(8 + self.dev.font_line_height() as isize),
-                );
+        let time_y = if media.is_some() { Some(8) } else { None };
+        let time_str = self.config.show_time.then(|| time.format("%I:%M:%S %p").to_string());
+        let media_changed = media != self.last_media;
+        let media_text = media
+            .as_ref()
+            .map(|m| format!("{}\n{}", m.title, m.artist))
+            .filter(|_| media_changed);
+        let old_time_layers = std::mem::take(&mut self.time_layers);
+        let old_media_layers = if media_changed {
+            std::mem::take(&mut self.media_layers)
+        } else {
+            vec![]
+        };
+        let mut new_time_layers = vec![];
+        let mut new_media_layers = vec![];
+        let media_y = 8 + self.dev.font_line_height() as isize;
+        self.dev.transact_layers(|txn| {
+            txn.remove_layers(&old_time_layers);
+            if let Some(time_str) = &time_str {
+                new_time_layers = txn.add_text_with_mode(time_str, None, time_y, true, TextOverflowMode::Scroll);
             }
+            if media_changed {
+                txn.remove_layers(&old_media_layers);
+                if let Some(media_text) = &media_text {
+                    new_media_layers =
+                        txn.add_text_with_mode(media_text, None, Some(media_y), true, TextOverflowMode::Scroll);
+                }
+            }
+        });
+        self.time_layers = new_time_layers;
+        if media_changed {
+            self.media_layers = new_media_layers;
             self.last_media = media;
         }
-
-        self.dev.play();
     }
 
     fn shutdown(self) {
@@ -812,7 +833,8 @@ fn main() {
     let mut initial_config = Some(config);
 
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(std::time::Instant::now() + TICK_DUR);
+        let tick_dur = runtime.as_ref().map_or(TICK_DUR_NORMAL, RuntimeState::tick_duration);
+        *control_flow = ControlFlow::WaitUntil(std::time::Instant::now() + tick_dur);
 
         match event {
             Event::NewEvents(StartCause::Init) => {

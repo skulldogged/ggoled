@@ -1,11 +1,22 @@
 use super::{Media, PlatformCapabilities};
 use mpris::{PlaybackStatus, PlayerFinder};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
 
+static IDLE_LOGGED: AtomicBool = AtomicBool::new(false);
+
 pub fn capabilities() -> PlatformCapabilities {
+    let idle_timeout = system_idle_time::get_idle_time().is_ok();
+    if !idle_timeout
+        && IDLE_LOGGED
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        warn!("failed to query Linux idle time; idle-timeout will be disabled");
+    }
     PlatformCapabilities {
         media: true,
-        idle_timeout: false,
+        idle_timeout,
         autostart: false,
     }
 }
@@ -45,8 +56,18 @@ impl MediaControl {
 }
 
 pub fn get_idle_seconds() -> usize {
-    // TODO
-    0
+    match system_idle_time::get_idle_time() {
+        Ok(idle) => idle.as_secs() as usize,
+        Err(err) => {
+            if IDLE_LOGGED
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                warn!(?err, "failed to query Linux idle time");
+            }
+            0
+        }
+    }
 }
 
 pub fn set_autostart(_enabled: bool) {}

@@ -3,6 +3,7 @@ use core::str;
 use ggoled_draw::bitmap_from_memory;
 use ggoled_draw::decode_frames;
 use ggoled_draw::DrawDevice;
+use ggoled_draw::TextOverflowMode;
 use ggoled_lib::Bitmap;
 use ggoled_lib::Device;
 use spin_sleep::sleep;
@@ -179,9 +180,14 @@ fn main() {
             delimiter,
         } => {
             let mut dev = DrawDevice::new(dev, 30);
-            // TODO: oneshot text should not try scrolling
             if let Some(text) = text {
-                dev.add_text(&text, draw_args.screen_x.to_option(), draw_args.screen_y.to_option());
+                dev.add_text_with_mode(
+                    &text,
+                    draw_args.screen_x.to_option(),
+                    draw_args.screen_y.to_option(),
+                    true,
+                    TextOverflowMode::Clip,
+                );
                 dev.play();
             } else {
                 dev.play();
