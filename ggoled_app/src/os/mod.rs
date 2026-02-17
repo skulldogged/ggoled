@@ -1,9 +1,12 @@
+use draconis::{init_static_plugins, initialize_plugin_manager, shutdown_plugin_manager, CacheManager, Plugin};
+
 #[derive(PartialEq)]
 pub struct Media {
     pub title: String,
     pub artist: String,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
 pub enum VolumeKeySignal {
     Up,
@@ -18,65 +21,88 @@ pub struct PlatformCapabilities {
     pub autostart: bool,
 }
 
-#[cfg(target_os = "windows")]
-pub mod windows;
-#[cfg(target_os = "windows")]
-pub use windows::*;
+pub struct MediaControl {
+    plugin: Option<Plugin>,
+    cache: CacheManager,
+}
 
-#[cfg(target_os = "linux")]
-pub mod linux;
-#[cfg(target_os = "linux")]
-pub use linux::*;
+impl MediaControl {
+    pub fn new() -> MediaControl {
+        initialize_plugin_manager();
+        let count = init_static_plugins();
+        if count == 0 {
+            tracing::warn!("No static plugins registered");
+        }
 
-#[cfg(target_os = "macos")]
-pub mod macos;
-#[cfg(target_os = "macos")]
-pub use macos::*;
-#[cfg(target_os = "macos")]
-mod macos_mediaremote;
+        let mut cache = CacheManager::new();
+        let mut plugin = Plugin::new("NowPlayingPlugin").ok();
 
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+        if let Some(ref mut p) = plugin {
+            if let Err(e) = p.initialize(&mut cache) {
+                tracing::warn!("Failed to initialize NowPlayingPlugin: {:?}", e);
+                plugin = None;
+            }
+        }
+
+        if plugin.is_none() {
+            tracing::warn!("Failed to load NowPlayingPlugin");
+        }
+
+        MediaControl { plugin, cache }
+    }
+
+    pub fn get_media(&mut self, _include_paused: bool) -> Option<Media> {
+        let plugin = self.plugin.as_mut()?;
+
+        if let Err(e) = plugin.collect_data(&mut self.cache) {
+            let last_error = plugin.get_last_error();
+            tracing::warn!("Failed to collect plugin data: {:?} (last_error: {:?})", e, last_error);
+            return None;
+        }
+
+        let fields = plugin.get_fields().ok()?;
+
+        tracing::debug!("Plugin fields: {:?}", fields);
+
+        let title = fields.get("title")?.clone();
+        let artist = fields.get("artist").cloned().unwrap_or_default();
+
+        if title.is_empty() {
+            return None;
+        }
+
+        Some(Media { title, artist })
+    }
+}
+
+impl Drop for MediaControl {
+    fn drop(&mut self) {
+        shutdown_plugin_manager();
+    }
+}
+
 pub fn capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
-        media: false,
+        media: true,
         idle_timeout: false,
         autostart: false,
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub fn set_autostart(_enabled: bool) {}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub fn get_autostart() -> bool {
     false
 }
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-pub struct MediaControl;
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-impl MediaControl {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn get_media(&self, _include_paused: bool) -> Option<Media> {
-        None
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub fn get_idle_seconds() -> usize {
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn start_volume_key_listener() -> Option<std::sync::mpsc::Receiver<VolumeKeySignal>> {
     None
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "macos")]
 pub fn ensure_accessibility_permission(_prompt: bool) -> bool {
     true
 }

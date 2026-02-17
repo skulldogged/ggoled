@@ -3,9 +3,7 @@
 mod os;
 
 use chrono::{DateTime, Local, TimeDelta, Timelike};
-use ggoled_draw::{
-    bitmap_from_memory, DrawDevice, DrawEvent, DrawLayer, LayerId, ShiftMode, TextOverflowMode, TextRenderer,
-};
+use ggoled_draw::{bitmap_from_memory, DrawDevice, DrawEvent, LayerId, ShiftMode, TextOverflowMode, TextRenderer};
 use ggoled_lib::Device;
 use os::{capabilities, get_autostart, get_idle_seconds, set_autostart, Media, MediaControl, PlatformCapabilities};
 #[cfg(target_os = "macos")]
@@ -31,9 +29,8 @@ const BASE_STATION_VOLUME_MAX: u8 = 56;
 const BASE_STATION_VOLUME_STEP: u8 = 4;
 const NOTIF_MARGIN_X: isize = 0;
 const NOTIF_MARGIN_Y: isize = 0;
-const OLED_WIDTH: isize = 128;
-const VOLUME_ICON_GAP: isize = 1;
 
+#[cfg(target_os = "macos")]
 fn volume_keys_debug(msg: impl AsRef<str>) {
     debug!(target: "volume-keys", "{}", msg.as_ref());
 }
@@ -72,6 +69,27 @@ struct ConfigFont {
     size: f32,
 }
 
+#[derive(Serialize, Deserialize, Default, Clone, Copy)]
+enum WeatherProvider {
+    #[default]
+    OpenMeteo,
+    MetNo,
+    OpenWeatherMap,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Copy)]
+enum WeatherUnits {
+    #[default]
+    Metric,
+    Imperial,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct WeatherCoords {
+    lat: f64,
+    lon: f64,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Config {
@@ -84,6 +102,11 @@ struct Config {
     show_notifications: bool,
     autostart: bool,
     pass_through_volume_keys: bool,
+    show_weather: bool,
+    weather_provider: WeatherProvider,
+    weather_units: WeatherUnits,
+    weather_coords: Option<WeatherCoords>,
+    weather_api_key: Option<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -97,6 +120,11 @@ impl Default for Config {
             show_notifications: true,
             autostart: false,
             pass_through_volume_keys: false,
+            show_weather: false,
+            weather_provider: WeatherProvider::default(),
+            weather_units: WeatherUnits::default(),
+            weather_coords: None,
+            weather_api_key: None,
         }
     }
 }
@@ -142,76 +170,74 @@ fn volume_to_percent(volume: u8) -> u8 {
 
 fn volume_icon_level(percent: u8) -> usize {
     if percent == 0 {
-        0 // muted: speaker + X
+        0
     } else if percent <= 32 {
-        1 // no waves
+        1
     } else if percent <= 64 {
-        2 // one wave
+        2
     } else if percent >= 100 {
-        4 // three waves
+        4
     } else {
-        3 // two waves
+        3
     }
 }
 
-fn make_volume_icon(waves: u8, muted: bool) -> ggoled_lib::Bitmap {
-    let mut icon = ggoled_lib::Bitmap::new(12, 9, false);
-    let points = vec![
-        // Speaker body + cone (always shown).
-        (0, 3),
-        (0, 4),
-        (0, 5),
-        (1, 2),
-        (1, 3),
-        (1, 4),
-        (1, 5),
-        (1, 6),
-        (2, 2),
-        (2, 3),
-        (2, 4),
-        (2, 5),
-        (2, 6),
-        (3, 1),
-        (3, 2),
-        (3, 3),
-        (3, 4),
-        (3, 5),
-        (3, 6),
-        (3, 7),
-    ];
-    let wave_1 = vec![(5, 2), (6, 3), (6, 4), (6, 5), (5, 6)];
-    let wave_2 = vec![(7, 1), (8, 2), (8, 3), (8, 4), (8, 5), (8, 6), (7, 7)];
-    let wave_3 = vec![
-        (9, 0),
-        (10, 1),
-        (11, 2),
-        (11, 3),
-        (11, 4),
-        (11, 5),
-        (11, 6),
-        (10, 7),
-        (9, 8),
-    ];
+fn volume_icon_char(level: usize) -> char {
+    match level {
+        0 => '\u{e07f}', // nf-md-volume_mute
+        1 => '\u{e050}', // nf-md-volume_low
+        2 => '\u{e05d}', // nf-md-volume_medium
+        3 => '\u{e05d}', // nf-md-volume_medium
+        4 => '\u{e057}', // nf-md-volume_high
+        _ => '\u{e057}',
+    }
+}
 
-    let mut points = points;
-    if waves >= 1 {
-        points.extend(wave_1);
-    }
-    if waves >= 2 {
-        points.extend(wave_2);
-    }
-    if waves >= 3 {
-        points.extend(wave_3);
-    }
-    if muted {
-        // Mute marker X on the right side.
-        points.extend([(7, 2), (8, 3), (9, 4), (10, 5), (10, 2), (9, 3), (8, 4), (7, 5)]);
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WeatherIconType {
+    ClearSky,
+    MainlyClear,
+    Overcast,
+    Fog,
+    Rain,
+    Snow,
+    Showers,
+    Thunderstorm,
+    Unknown,
+}
 
-    for (x, y) in points {
-        icon.data.set(y * icon.w + x, true);
+impl WeatherIconType {
+    fn from_code(code: i32) -> Self {
+        match code {
+            0 => WeatherIconType::ClearSky,
+            1 | 2 => WeatherIconType::MainlyClear,
+            3 => WeatherIconType::Overcast,
+            45 | 48 => WeatherIconType::Fog,
+            51..=67 => WeatherIconType::Rain,
+            71..=77 => WeatherIconType::Snow,
+            80..=86 => WeatherIconType::Showers,
+            95..=99 => WeatherIconType::Thunderstorm,
+            _ => WeatherIconType::Unknown,
+        }
     }
-    icon
+}
+
+fn weather_icon_char(icon_type: WeatherIconType) -> char {
+    match icon_type {
+        WeatherIconType::ClearSky => '\u{e30b}',     // nf-weather-day_sunny
+        WeatherIconType::MainlyClear => '\u{e312}',  // nf-weather-day_cloudy
+        WeatherIconType::Overcast => '\u{e312}',     // nf-weather-cloud
+        WeatherIconType::Fog => '\u{e313}',          // nf-weather-fog
+        WeatherIconType::Rain => '\u{e318}',         // nf-weather-rain
+        WeatherIconType::Snow => '\u{e31a}',         // nf-weather-snowflake_cold
+        WeatherIconType::Showers => '\u{e309}',      // nf-weather-showers
+        WeatherIconType::Thunderstorm => '\u{e31d}', // nf-weather-thunderstorm
+        WeatherIconType::Unknown => '\u{e374}',      // nf-weather-thermometer
+    }
+}
+
+fn parse_weather_code_from_description(_desc: &str) -> Option<i32> {
+    None
 }
 
 struct TrayState {
@@ -224,6 +250,8 @@ struct TrayState {
     tm_notif_check: CheckMenuItem,
     tm_idle_check: CheckMenuItem,
     tm_autostart_check: CheckMenuItem,
+    tm_weather_check: CheckMenuItem,
+    tm_open_config: MenuItem,
     tm_volume_down: MenuItem,
     tm_volume_up: MenuItem,
     tm_volume_mute: MenuItem,
@@ -236,6 +264,13 @@ struct TrayState {
     tm_shift_off: CheckMenuItem,
     tm_shift_simple: CheckMenuItem,
     tm_quit: MenuItem,
+}
+
+struct WeatherState {
+    temperature: Option<f64>,
+    weather_code: Option<i32>,
+    units: WeatherUnits,
+    last_fetch: Option<DateTime<Local>>,
 }
 
 struct RuntimeState {
@@ -255,7 +290,9 @@ struct RuntimeState {
     needs_redraw: bool,
     icon_hs_connect: Arc<ggoled_lib::Bitmap>,
     icon_hs_disconnect: Arc<ggoled_lib::Bitmap>,
-    icon_volume_levels: [Arc<ggoled_lib::Bitmap>; 5],
+    weather: WeatherState,
+    weather_cache: draconis::CacheManager,
+    weather_plugin: Option<draconis::Plugin>,
     #[cfg(target_os = "macos")]
     volume_key_rx: Option<std::sync::mpsc::Receiver<VolumeKeySignal>>,
 }
@@ -276,17 +313,12 @@ impl RuntimeState {
             Arc::new(bitmap_from_memory(include_bytes!("../assets/headset_connected.png"), 0x80).unwrap());
         let icon_hs_disconnect =
             Arc::new(bitmap_from_memory(include_bytes!("../assets/headset_disconnected.png"), 0x80).unwrap());
-        let icon_volume_levels = [
-            Arc::new(make_volume_icon(0, true)),
-            Arc::new(make_volume_icon(0, false)),
-            Arc::new(make_volume_icon(1, false)),
-            Arc::new(make_volume_icon(2, false)),
-            Arc::new(make_volume_icon(3, false)),
-        ];
 
         let mut dev = DrawDevice::new(Device::connect()?, 30);
         if let Some(font) = &config.font {
             dev.texter = TextRenderer::load_from_file(&font.path, font.size)?;
+        } else {
+            dev.texter = TextRenderer::new_cozette();
         }
 
         dev.set_shift_mode(config.oled_shift.to_api());
@@ -319,6 +351,75 @@ impl RuntimeState {
             None
         };
 
+        let weather_plugin = if config.show_weather && config.weather_coords.is_some() {
+            let count = draconis::init_static_plugins();
+            tracing::debug!("Initialized {} static plugins", count);
+            draconis::initialize_plugin_manager();
+
+            match draconis::Plugin::new("WeatherPlugin") {
+                Ok(mut plugin) => {
+                    let coords = config.weather_coords.as_ref().unwrap();
+                    let provider_str = match config.weather_provider {
+                        WeatherProvider::OpenMeteo => "openmeteo",
+                        WeatherProvider::MetNo => "metno",
+                        WeatherProvider::OpenWeatherMap => "openweathermap",
+                    };
+                    let units_str = match config.weather_units {
+                        WeatherUnits::Metric => "metric",
+                        WeatherUnits::Imperial => "imperial",
+                    };
+
+                    let weather_toml = if let Some(ref api_key) = config.weather_api_key {
+                        format!(
+                            r#"enabled = true
+provider = "{}"
+units = "{}"
+api_key = "{}"
+[coords]
+lat = {}
+lon = {}"#,
+                            provider_str, units_str, api_key, coords.lat, coords.lon
+                        )
+                    } else {
+                        format!(
+                            r#"enabled = true
+provider = "{}"
+units = "{}"
+[coords]
+lat = {}
+lon = {}"#,
+                            provider_str, units_str, coords.lat, coords.lon
+                        )
+                    };
+
+                    let mut cache = draconis::CacheManager::new();
+
+                    if let Err(e) = plugin.set_config(&weather_toml) {
+                        warn!("failed to set weather plugin config: {:?}", e);
+                    }
+
+                    if let Err(e) = plugin.initialize(&mut cache) {
+                        warn!("failed to initialize weather plugin: {:?}", e);
+                        None
+                    } else {
+                        tracing::info!("Weather plugin loaded and initialized");
+                        Some(plugin)
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to load weather plugin: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            if config.show_weather {
+                warn!("Weather enabled but no coordinates configured");
+            }
+            None
+        };
+
+        let weather_units = config.weather_units;
+
         Ok(RuntimeState {
             capabilities,
             config,
@@ -336,7 +437,14 @@ impl RuntimeState {
             needs_redraw: false,
             icon_hs_connect,
             icon_hs_disconnect,
-            icon_volume_levels,
+            weather: WeatherState {
+                temperature: None,
+                weather_code: None,
+                units: weather_units,
+                last_fetch: None,
+            },
+            weather_cache: draconis::CacheManager::new(),
+            weather_plugin,
             #[cfg(target_os = "macos")]
             volume_key_rx,
         })
@@ -366,27 +474,13 @@ impl RuntimeState {
             return;
         }
         let percent = volume_to_percent(volume);
-        let text = format!("{percent}");
-        let width = self
-            .dev
-            .measure_line_widths(&text)
-            .first()
-            .map(|w| *w as isize)
-            .unwrap_or(0);
-        let icon = self.icon_volume_levels[volume_icon_level(percent)].clone();
-        let total_width = icon.w as isize + VOLUME_ICON_GAP + width;
-        let x = (OLED_WIDTH - total_width - NOTIF_MARGIN_X).max(0);
+        let icon_char = volume_icon_char(volume_icon_level(percent));
+        let text = format!("{} {}%", icon_char, percent);
         self.clear_notification();
-        self.notif_layers.push(self.dev.add_layer(DrawLayer::ImageNoShift {
-            bitmap: icon.clone(),
-            x,
-            y: NOTIF_MARGIN_Y,
-        }));
-        self.notif_layers.extend(self.dev.add_text_no_shift(
-            &text,
-            Some(x + icon.w as isize + VOLUME_ICON_GAP),
-            Some(NOTIF_MARGIN_Y),
-        ));
+        self.notif_layers.extend(
+            self.dev
+                .add_text_no_shift(&text, Some(NOTIF_MARGIN_X), Some(NOTIF_MARGIN_Y)),
+        );
         self.notif_expiry = Local::now() + TimeDelta::from_std(NOTIF_DUR).unwrap();
         self.needs_redraw = true;
     }
@@ -443,12 +537,14 @@ impl RuntimeState {
             || event.id == self.tray.tm_media_paused_check.id()
             || event.id == self.tray.tm_notif_check.id()
             || event.id == self.tray.tm_idle_check.id()
+            || event.id == self.tray.tm_weather_check.id()
         {
             self.config.show_time = self.tray.tm_time_check.is_checked();
             self.config.show_media = self.capabilities.media && self.tray.tm_media_check.is_checked();
             self.config.show_media_paused = self.capabilities.media && self.tray.tm_media_paused_check.is_checked();
             self.config.show_notifications = self.tray.tm_notif_check.is_checked();
             self.config.idle_timeout = self.capabilities.idle_timeout && self.tray.tm_idle_check.is_checked();
+            self.config.show_weather = self.tray.tm_weather_check.is_checked();
             config_updated = true;
         }
 
@@ -533,6 +629,32 @@ impl RuntimeState {
             self.set_base_station_volume(next);
         }
 
+        if event.id == self.tray.tm_open_config.id() {
+            let config_path = Config::path();
+            #[cfg(target_os = "windows")]
+            {
+                std::process::Command::new("explorer")
+                    .arg("/select,")
+                    .arg(&config_path)
+                    .spawn()
+                    .ok();
+            }
+            #[cfg(target_os = "macos")]
+            {
+                std::process::Command::new("open")
+                    .arg("-R")
+                    .arg(&config_path)
+                    .spawn()
+                    .ok();
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(parent) = config_path.parent() {
+                    std::process::Command::new("xdg-open").arg(parent).spawn().ok();
+                }
+            }
+        }
+
         if config_updated {
             self.needs_redraw = true;
             if let Err(err) = self.save_config() {
@@ -615,7 +737,9 @@ impl RuntimeState {
         }
 
         let time = Local::now();
-        if time.second() == self.last_time.second() && !force_redraw {
+        let time_changed = time.second() != self.last_time.second();
+
+        if !time_changed && !force_redraw {
             return;
         }
         self.last_time = time;
@@ -631,6 +755,37 @@ impl RuntimeState {
             return;
         }
 
+        if let Some(ref mut plugin) = self.weather_plugin {
+            let should_fetch = self.weather.last_fetch.is_none()
+                || self
+                    .weather
+                    .last_fetch
+                    .is_some_and(|last| time.signed_duration_since(last).num_minutes() >= 10);
+
+            if should_fetch {
+                match plugin.collect_data(&mut self.weather_cache) {
+                    Ok(()) => match plugin.get_fields() {
+                        Ok(fields) => {
+                            tracing::debug!("Weather fields: {:?}", fields);
+                            if let Some(temp_str) = fields.get("temperature") {
+                                self.weather.temperature = temp_str.parse().ok();
+                            }
+                            if let Some(desc) = fields.get("description") {
+                                self.weather.weather_code = parse_weather_code_from_description(desc);
+                            }
+                            self.weather.last_fetch = Some(time);
+                        }
+                        Err(e) => {
+                            warn!("Failed to get weather fields: {:?}", e);
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Failed to collect weather data: {:?}", e);
+                    }
+                }
+            }
+        }
+
         let media = if self.config.show_media {
             self.mgr.get_media(self.config.show_media_paused)
         } else {
@@ -638,7 +793,28 @@ impl RuntimeState {
         };
 
         let time_y = if media.is_some() { Some(8) } else { None };
-        let time_str = self.config.show_time.then(|| time.format("%I:%M:%S %p").to_string());
+
+        let time_str = if self.config.show_time {
+            let time_formatted = time.format("%I:%M %p").to_string();
+            if self.config.show_weather && self.weather.temperature.is_some() {
+                let temp = self.weather.temperature.unwrap();
+                let unit = match self.weather.units {
+                    WeatherUnits::Metric => "C",
+                    WeatherUnits::Imperial => "F",
+                };
+                let icon_char = if let Some(code) = self.weather.weather_code {
+                    weather_icon_char(WeatherIconType::from_code(code))
+                } else {
+                    weather_icon_char(WeatherIconType::Unknown)
+                };
+                Some(format!("{} - {} {:.0}{}", time_formatted, icon_char, temp, unit))
+            } else {
+                Some(time_formatted)
+            }
+        } else {
+            None
+        };
+
         let media_changed = media != self.last_media;
         let media_text = media
             .as_ref()
@@ -700,6 +876,8 @@ fn create_tray(config: &Config, capabilities: PlatformCapabilities) -> anyhow::R
     let tm_notif_check = CheckMenuItem::new("Show connection notifications", true, config.show_notifications, None);
     let tm_idle_check = CheckMenuItem::new("Screensaver when idle", true, config.idle_timeout, None);
     let tm_autostart_check = CheckMenuItem::new("Start at login", true, config.autostart, None);
+    let tm_weather_check = CheckMenuItem::new("Show weather", true, config.show_weather, None);
+    let tm_open_config = MenuItem::new("Open config file", true, None);
     let tm_volume_down = MenuItem::new("Volume down", true, None);
     let tm_volume_up = MenuItem::new("Volume up", true, None);
     let tm_volume_mute = MenuItem::new("Mute", true, None);
@@ -718,9 +896,11 @@ fn create_tray(config: &Config, capabilities: PlatformCapabilities) -> anyhow::R
     menu.append(&tm_time_check)?;
     menu.append(&tm_media_check)?;
     menu.append(&tm_media_paused_check)?;
+    menu.append(&tm_weather_check)?;
     menu.append(&tm_notif_check)?;
     menu.append(&tm_idle_check)?;
     menu.append(&tm_autostart_check)?;
+    menu.append(&tm_open_config)?;
 
     let tm_volume_submenu = Submenu::new("Base station volume", true);
     tm_volume_submenu.append(&tm_volume_down)?;
@@ -780,6 +960,8 @@ fn create_tray(config: &Config, capabilities: PlatformCapabilities) -> anyhow::R
         tm_notif_check,
         tm_idle_check,
         tm_autostart_check,
+        tm_weather_check,
+        tm_open_config,
         tm_volume_down,
         tm_volume_up,
         tm_volume_mute,
@@ -805,12 +987,16 @@ fn main() {
     config.show_media_paused = config.show_media_paused && capabilities.media;
     config.idle_timeout = config.idle_timeout && capabilities.idle_timeout;
     config.autostart = if capabilities.autostart { get_autostart() } else { false };
+    config.show_weather = config.show_weather && config.weather_coords.is_some();
     #[cfg(not(target_os = "macos"))]
     {
         config.pass_through_volume_keys = false;
     }
 
+    #[cfg(target_os = "macos")]
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    #[cfg(not(target_os = "macos"))]
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     #[cfg(target_os = "macos")]
     {
         // Tray app behavior: no Dock tile and no app switcher presence.

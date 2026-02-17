@@ -52,6 +52,15 @@ impl TextRenderer {
             },
         }
     }
+    pub fn new_cozette() -> Self {
+        let font_data = include_str!("../fonts/cozette.bdf");
+        let cursor = std::io::Cursor::new(font_data.as_bytes());
+        Self {
+            inner: FontInner::Bdf {
+                font: Box::new(bdf2::read(cursor).unwrap()),
+            },
+        }
+    }
     pub fn line_height(&self) -> usize {
         match &self.inner {
             FontInner::Ttf { font, size } => {

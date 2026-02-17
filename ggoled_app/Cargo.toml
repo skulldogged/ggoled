@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 ggoled_lib = { path = "../ggoled_lib" }
 ggoled_draw = { path = "../ggoled_draw" }
+draconis = { git = "https://github.com/skulldogged/draconisplusplus-monorepo", branch = "master" }
 
 image = { version = "*" }
 chrono = "*"

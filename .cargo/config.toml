@@ -1,2 +1,9 @@
 [alias]
 xtask = "run -p xtask --"
+
+[env]
+# Static plugins to compile into draconis++
+# These will be linked directly into the binary
+DRAC_STATIC_PLUGINS = "now_playing,weather"
+# Build type: debug, release, debugoptimized
+DRAC_BUILD_TYPE = "release"
