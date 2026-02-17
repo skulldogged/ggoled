@@ -184,12 +184,9 @@ fn volume_icon_level(percent: u8) -> usize {
 
 fn volume_icon_char(level: usize) -> char {
     match level {
-        0 => '\u{e07f}', // nf-md-volume_mute
-        1 => '\u{e050}', // nf-md-volume_low
-        2 => '\u{e05d}', // nf-md-volume_medium
-        3 => '\u{e05d}', // nf-md-volume_medium
-        4 => '\u{e057}', // nf-md-volume_high
-        _ => '\u{e057}',
+        0 => '\u{e202}', // mute
+        1 => '\u{e204}', // low vol
+        _ => '\u{e203}', // high vol
     }
 }
 
@@ -224,15 +221,15 @@ impl WeatherIconType {
 
 fn weather_icon_char(icon_type: WeatherIconType) -> char {
     match icon_type {
-        WeatherIconType::ClearSky => '\u{e30b}',     // nf-weather-day_sunny
-        WeatherIconType::MainlyClear => '\u{e312}',  // nf-weather-day_cloudy
-        WeatherIconType::Overcast => '\u{e312}',     // nf-weather-cloud
-        WeatherIconType::Fog => '\u{e313}',          // nf-weather-fog
-        WeatherIconType::Rain => '\u{e318}',         // nf-weather-rain
-        WeatherIconType::Snow => '\u{e31a}',         // nf-weather-snowflake_cold
-        WeatherIconType::Showers => '\u{e309}',      // nf-weather-showers
-        WeatherIconType::Thunderstorm => '\u{e31d}', // nf-weather-thunderstorm
-        WeatherIconType::Unknown => '\u{e374}',      // nf-weather-thermometer
+        WeatherIconType::ClearSky => '\u{e234}',     // sun
+        WeatherIconType::MainlyClear => '\u{e231}',  // partly cloudy
+        WeatherIconType::Overcast => '\u{e22b}',     // cloud
+        WeatherIconType::Fog => '\u{e235}',          // wind
+        WeatherIconType::Rain => '\u{e22d}',         // rain
+        WeatherIconType::Snow => '\u{e22e}',         // snow
+        WeatherIconType::Showers => '\u{e230}',      // alternate rain
+        WeatherIconType::Thunderstorm => '\u{e22c}', // lightning
+        WeatherIconType::Unknown => '\u{e233}',      // moon
     }
 }
 
@@ -318,7 +315,7 @@ impl RuntimeState {
         if let Some(font) = &config.font {
             dev.texter = TextRenderer::load_from_file(&font.path, font.size)?;
         } else {
-            dev.texter = TextRenderer::new_cozette();
+            dev.texter = TextRenderer::new_merged();
         }
 
         dev.set_shift_mode(config.oled_shift.to_api());
@@ -794,7 +791,8 @@ lon = {}"#,
 
         let time_y = if media.is_some() { Some(8) } else { None };
 
-        let time_str = if self.config.show_time {
+        // Build the full display string with time and weather
+        let display_str = if self.config.show_time {
             let time_formatted = time.format("%I:%M %p").to_string();
             if self.config.show_weather && self.weather.temperature.is_some() {
                 let temp = self.weather.temperature.unwrap();
@@ -807,12 +805,12 @@ lon = {}"#,
                 } else {
                     weather_icon_char(WeatherIconType::Unknown)
                 };
-                Some(format!("{} - {} {:.0}{}", time_formatted, icon_char, temp, unit))
+                format!("{} - {}{:.0}{}", time_formatted, icon_char, temp, unit)
             } else {
-                Some(time_formatted)
+                time_formatted
             }
         } else {
-            None
+            String::new()
         };
 
         let media_changed = media != self.last_media;
@@ -829,10 +827,12 @@ lon = {}"#,
         let mut new_time_layers = vec![];
         let mut new_media_layers = vec![];
         let media_y = 8 + self.dev.font_line_height() as isize;
+
         self.dev.transact_layers(|txn| {
             txn.remove_layers(&old_time_layers);
-            if let Some(time_str) = &time_str {
-                new_time_layers = txn.add_text_with_mode(time_str, None, time_y, true, TextOverflowMode::Scroll);
+            // Use merged font (cozette + siji) for everything
+            if !display_str.is_empty() {
+                new_time_layers = txn.add_text_with_mode(&display_str, None, time_y, true, TextOverflowMode::Scroll);
             }
             if media_changed {
                 txn.remove_layers(&old_media_layers);

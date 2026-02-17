@@ -20,6 +20,19 @@ enum FontInner {
     Bdf { font: Box<bdf2::Font> },
 }
 
+impl Clone for FontInner {
+    fn clone(&self) -> Self {
+        match self {
+            FontInner::Ttf { font, size } => FontInner::Ttf {
+                font: font.clone(),
+                size: *size,
+            },
+            FontInner::Bdf { font } => FontInner::Bdf { font: font.clone() },
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct TextRenderer {
     inner: FontInner,
 }
@@ -52,12 +65,21 @@ impl TextRenderer {
             },
         }
     }
-    pub fn new_cozette() -> Self {
-        let font_data = include_str!("../fonts/cozette.bdf");
+    pub fn new_merged() -> Self {
+        let font_data = include_str!("../fonts/merged.bdf");
         let cursor = std::io::Cursor::new(font_data.as_bytes());
         Self {
             inner: FontInner::Bdf {
                 font: Box::new(bdf2::read(cursor).unwrap()),
+            },
+        }
+    }
+    pub fn new_siji() -> Self {
+        let font_data = include_str!("../fonts/merged.bdf");
+        let cursor = std::io::Cursor::new(font_data.as_bytes());
+        Self {
+            inner: FontInner::Bdf {
+                font: Box::new(bdf2::read(cursor).expect("Failed to parse Merged BDF font")),
             },
         }
     }
@@ -151,11 +173,11 @@ impl TextRenderer {
                         if text_line.is_empty() {
                             return Bitmap::new(0, line_h, false);
                         }
-                        let mut glyph_data: Vec<(&bdf2::Glyph, i32)> = Vec::new();
+                        let mut glyph_data: Vec<(char, &bdf2::Glyph, i32)> = Vec::new();
                         let mut cursor_x: i32 = 0;
                         for ch in text_line.chars() {
                             if let Some(glyph) = font.glyphs().get(&ch) {
-                                glyph_data.push((glyph, cursor_x));
+                                glyph_data.push((ch, glyph, cursor_x));
                                 cursor_x += glyph.device_width().unwrap_or(&(bounds.width, 0)).0 as i32;
                             }
                         }
@@ -164,7 +186,7 @@ impl TextRenderer {
                             return Bitmap::new(0, line_h, false);
                         }
                         let mut bitmap = Bitmap::new(line_w, line_h, false);
-                        for (glyph, x_off) in &glyph_data {
+                        for (_glyph_ch, glyph, x_off) in &glyph_data {
                             let gb = glyph.bounds();
                             let baseline_y = bounds.height as i32 + bounds.y;
                             let glyph_origin_y = baseline_y - gb.height as i32 - gb.y;
@@ -685,9 +707,6 @@ impl<'a> LayerTxn<'a> {
             self.layers.remove(id);
         }
     }
-    pub fn clear_layers(&mut self) {
-        self.layers.clear();
-    }
     pub fn add_text_with_mode(
         &mut self,
         text: &str,
@@ -697,7 +716,29 @@ impl<'a> LayerTxn<'a> {
         mode: TextOverflowMode,
     ) -> Vec<LayerId> {
         add_text_layers(
-            self.texter,
+            &self.texter,
+            self.width,
+            self.height,
+            self.layer_counter,
+            &mut self.layers,
+            text,
+            x,
+            y,
+            shift,
+            mode,
+        )
+    }
+    pub fn add_text_with_font(
+        &mut self,
+        text: &str,
+        font: &TextRenderer,
+        x: Option<isize>,
+        y: Option<isize>,
+        shift: bool,
+        mode: TextOverflowMode,
+    ) -> Vec<LayerId> {
+        add_text_layers(
+            font,
             self.width,
             self.height,
             self.layer_counter,
@@ -753,6 +794,21 @@ impl DrawDevice {
         (
             (self.width as isize - bitmap.w as isize) / 2,
             (self.height as isize - bitmap.h as isize) / 2,
+        )
+    }
+
+    pub fn add_text_with_font(&mut self, text: &str, font: &TextRenderer, x: isize, y: isize) -> Vec<LayerId> {
+        add_text_layers(
+            font,
+            self.width,
+            self.height,
+            &mut self.layer_counter,
+            &mut self.layers.lock().unwrap(),
+            text,
+            Some(x),
+            Some(y),
+            false,
+            TextOverflowMode::Clip,
         )
     }
     pub fn add_layer(&mut self, layer: DrawLayer) -> LayerId {
